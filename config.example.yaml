@@ -1,0 +1,113 @@
+# Shakespeare AI configuration.
+#
+# Any secret may be written as ${ENV_VAR} to read it from the environment.
+
+listen: 127.0.0.1:8000
+
+# The public URL clients reach this service at. NIP-98 auth events are signed
+# for it, so it must match what clients see, not what this process sees.
+origin: https://ai.shakespeare.diy
+
+# SQLite database. A relative path is relative to this file.
+database: shakespeare-ai.sqlite3
+
+payments:
+  # Charged on top of the credits bought: 0.1 is 10%.
+  fee: 0.1
+  # The fewest dollars one payment or gift card may be for.
+  minimum: 5
+  stripe:
+    secret_key: ${STRIPE_SECRET_KEY}
+    webhook_secret: ${STRIPE_WEBHOOK_SECRET}
+  lightning:
+    # The address's LNURL-pay server must return a LUD-21 `verify` URL with
+    # each invoice; that's how payment is confirmed. (LNbits' lnurlp doesn't.)
+    address: credits@example.com
+
+# Upstream OpenAI-compatible APIs.
+providers:
+  anthropic:
+    base_url: https://api.anthropic.com/v1
+    api_key: ${ANTHROPIC_API_KEY}
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    # Usage accounting (OpenRouter reports each request's real cost) and
+    # prompt caching breakpoints for anthropic/ models.
+    openrouter: true
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+# What clients ask for, by id. `upstream` is provider/model: everything after
+# the first slash is the provider's own model id. Chat prices are USD per
+# million tokens. `hidden` keeps a model out of /v1/models without disabling
+# it; free chat models are always hidden.
+models:
+  claude-sonnet-4.6:
+    upstream: anthropic/claude-sonnet-4-6
+    name: Claude Sonnet 4.6
+    description: Highly capable programming model, able to understand and perform complex tasks.
+    context_window: 200000
+    price: { input: 3, output: 15 }
+
+  claude-opus-4.8:
+    upstream: anthropic/claude-opus-4-8
+    name: Claude Opus 4.8
+    description: If money is no obstacle, this model can get the job done.
+    context_window: 200000
+    price: { input: 5, output: 25 }
+
+  claude-sonnet-4.5:
+    upstream: anthropic/claude-sonnet-4-5-20250929
+    name: Claude Sonnet 4.5
+    hidden: true
+    context_window: 200000
+    price: { input: 3, output: 15 }
+
+  claude-opus-4.5:
+    upstream: anthropic/claude-opus-4-5-20251101
+    name: Claude Opus 4.5
+    hidden: true
+    context_window: 200000
+    price: { input: 5, output: 25 }
+
+  claude-opus-4.6:
+    upstream: anthropic/claude-opus-4-6
+    name: Claude Opus 4.6
+    hidden: true
+    context_window: 200000
+    price: { input: 5, output: 25 }
+
+  # Hidden: they misbehave in Shakespeare for now.
+  claude-sonnet-5:
+    upstream: anthropic/claude-sonnet-5
+    name: Claude Sonnet 5
+    hidden: true
+    context_window: 200000
+    price: { input: 2, output: 10 }
+
+  claude-opus-5:
+    upstream: anthropic/claude-opus-5
+    name: Claude Opus 5
+    hidden: true
+    context_window: 200000
+    price: { input: 5, output: 25 }
+
+  # Free, and so unlisted; Ditto's buddy uses it by id.
+  gemma-4-26b:
+    upstream: openrouter/google/gemma-4-26b-a4b-it
+    name: Gemma 4 26B A4B
+    description: Google DeepMind's instruction-tuned Mixture-of-Experts model.
+    context_window: 262144
+    price: { input: 0, output: 0 }
+
+  # Image models are priced per image, by quality and shape.
+  gpt-image-1:
+    upstream: openai/gpt-image-1
+    name: GPT Image 1
+    description: Generate high-quality images from text descriptions.
+    price:
+      low: { square: 0.011, wide: 0.016 }
+      medium: { square: 0.042, wide: 0.063 }
+      high: { square: 0.167, wide: 0.25 }
