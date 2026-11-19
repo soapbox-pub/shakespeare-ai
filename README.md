@@ -39,8 +39,9 @@ Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
 
 The site at `/` is a dashboard (`dashboard/`, React and Vite, started from
 mkstack): the models and their prices for anyone, and for someone logged in
-with Nostr, their balance, buying credits, redeeming gift cards, payments and
-usage. It has no API of its own. It signs each request to the public API with
+with Nostr, their balance, buying credits, payments, API keys, gift cards
+(bought, listed, cancelled and redeemed) and usage. A gift card's link is
+`/credits#redeem=<code>`, the code in the fragment so it stays out of logs. It has no API of its own. It signs each request to the public API with
 NIP-98, as any client does, so there are no sessions or cookies.
 
 Any path that isn't the API's (`/v1/…`, `/webhooks/…`, `/docs`, `/terms`,

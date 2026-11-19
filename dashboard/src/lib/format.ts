@@ -24,3 +24,8 @@ export function tokens(n: number): string {
 export function dateTime(unix: number): string {
   return new Date(unix * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
+
+/** A Unix time as a date alone. */
+export function date(unix: number): string {
+  return new Date(unix * 1000).toLocaleDateString(undefined, { dateStyle: 'medium' });
+}

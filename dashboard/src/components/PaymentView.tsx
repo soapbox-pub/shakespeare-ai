@@ -1,6 +1,6 @@
 import { CircleCheck, Clock, ExternalLink, Loader2 } from 'lucide-react';
 
-import { CopyButton } from '@/components/CopyButton';
+import { CopyField } from '@/components/CopyField';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { QRCodeCanvas } from '@/components/ui/qrcode';
@@ -66,7 +66,7 @@ function Lightning({ invoice }: { invoice: string }) {
       <a href={uri} className="mx-auto block w-fit rounded-lg bg-white p-2" aria-label="Open the invoice in your wallet">
         <QRCodeCanvas value={uri.toUpperCase()} size={240} />
       </a>
-      <Field label="Invoice" value={invoice} />
+      <CopyField label="Invoice" value={invoice} />
       <Button asChild variant="outline" className="w-full">
         <a href={uri}>Open in wallet</a>
       </Button>
@@ -83,26 +83,14 @@ function Bitcoin({ uri }: { uri: string }) {
       <a href={uri} className="mx-auto block w-fit rounded-lg bg-white p-2" aria-label="Open the payment in your wallet">
         <QRCodeCanvas value={uri} size={240} />
       </a>
-      <Field label="Address" value={address} />
-      {amount && <Field label="Amount (BTC)" value={amount} />}
+      <CopyField label="Address" value={address} />
+      {amount && <CopyField label="Amount (BTC)" value={amount} />}
       <Alert>
         <AlertDescription>
           Send exactly this amount, in one transaction. Paying less adds no credits, and paying more adds only what
           you bought.
         </AlertDescription>
       </Alert>
-    </div>
-  );
-}
-
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="flex items-center gap-1 rounded-md border bg-muted/40 py-0.5 pr-0.5 pl-3">
-        <code className="flex-1 truncate text-sm">{value}</code>
-        <CopyButton value={value} label={`Copy the ${label.toLowerCase()}`} />
-      </div>
     </div>
   );
 }

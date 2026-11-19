@@ -15,7 +15,7 @@ export function useApi(): ApiClient | undefined {
 }
 
 /** Query keys start with the account, so one account's data never shows for another. */
-function useAccountKey(): string | undefined {
+export function useAccountKey(): string | undefined {
   return useCurrentUser().user?.pubkey;
 }
 
@@ -45,7 +45,7 @@ export function useModels() {
 }
 
 /** A paged list, newest first, loading 50 more at a time. */
-function useList<T extends { id: string }>(name: string, fetch: (api: ApiClient, after?: string) => Promise<List<T>>) {
+export function useList<T extends { id: string }>(name: string, fetch: (api: ApiClient, after?: string) => Promise<List<T>>) {
   const api = useApi();
   const pubkey = useAccountKey();
   return useInfiniteQuery({
@@ -97,6 +97,36 @@ export function useAddCredits() {
   return useMutation({
     mutationFn: (input: { amount: number; method: PaymentMethod; redirect_url?: string }) => api!.addCredits(input),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['payments', pubkey] }),
+  });
+}
+
+export function useGiftcards() {
+  return useList('giftcards', (api, after) => api.giftcards(after));
+}
+
+export function useCreateGiftcards() {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: { amount: number; quantity: number }) => (await api!.createGiftcards(input)).data,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['balance', pubkey] });
+      void queryClient.invalidateQueries({ queryKey: ['giftcards', pubkey] });
+    },
+  });
+}
+
+export function useCancelGiftcard() {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api!.cancelGiftcard(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['balance', pubkey] });
+      void queryClient.invalidateQueries({ queryKey: ['giftcards', pubkey] });
+    },
   });
 }
 

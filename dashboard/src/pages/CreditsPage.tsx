@@ -1,8 +1,10 @@
 import { useSeoMeta } from '@unhead/react';
-import { Gift, Plus } from 'lucide-react';
-import { useState } from 'react';
+import { Gift, Plus, ShoppingBag } from 'lucide-react';
+import { useEffect, useState } from 'react';
 
 import { AddCreditsDialog } from '@/components/AddCreditsDialog';
+import { BuyGiftcardsDialog } from '@/components/BuyGiftcardsDialog';
+import { GiftcardList } from '@/components/GiftcardList';
 import { RedeemGiftcardDialog } from '@/components/RedeemGiftcardDialog';
 import { RequireLogin } from '@/components/RequireLogin';
 import { Badge } from '@/components/ui/badge';
@@ -13,6 +15,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { useBalance, usePayments } from '@/hooks/useCredits';
 import type { Payment } from '@/lib/api';
 import { dateTime, usd } from '@/lib/format';
+import { codeFromHash } from '@/lib/giftcards';
 
 export default function CreditsPage() {
   useSeoMeta({ title: 'Credits · Shakespeare AI' });
@@ -26,8 +29,29 @@ export default function CreditsPage() {
 function Credits() {
   const balance = useBalance();
   const [adding, setAdding] = useState(false);
-  const [redeeming, setRedeeming] = useState(false);
+  // A gift card's link opens the page ready to redeem it, whether it's
+  // opened fresh or pasted into a tab that's already here.
+  const [linkedCode, setLinkedCode] = useState(() => codeFromHash(location.hash));
+  const [redeeming, setRedeeming] = useState(!!linkedCode);
+
+  useEffect(() => {
+    const follow = () => {
+      const code = codeFromHash(location.hash);
+      if (!code) return;
+      setLinkedCode(code);
+      setRedeeming(true);
+    };
+    addEventListener('hashchange', follow);
+    return () => removeEventListener('hashchange', follow);
+  }, []);
+  const [buying, setBuying] = useState(false);
   const [resuming, setResuming] = useState<Payment>();
+
+  const closeRedeem = (open: boolean) => {
+    setRedeeming(open);
+    // Leave no code behind to reopen the dialog on a refresh.
+    if (!open && linkedCode) history.replaceState(null, '', location.pathname + location.search);
+  };
 
   return (
     <div className="space-y-10">
@@ -48,14 +72,20 @@ function Credits() {
           <Button variant="outline" onClick={() => setRedeeming(true)}>
             <Gift className="size-4" /> Redeem a gift card
           </Button>
+          <Button variant="outline" onClick={() => setBuying(true)}>
+            <ShoppingBag className="size-4" /> Buy gift cards
+          </Button>
         </CardContent>
       </Card>
 
       <PaymentHistory onResume={setResuming} />
 
+      <GiftcardList onBuy={() => setBuying(true)} />
+
       <AddCreditsDialog open={adding} onOpenChange={setAdding} />
       <AddCreditsDialog open={!!resuming} onOpenChange={(open) => !open && setResuming(undefined)} payment={resuming} />
-      <RedeemGiftcardDialog open={redeeming} onOpenChange={setRedeeming} />
+      <RedeemGiftcardDialog key={linkedCode} open={redeeming} onOpenChange={closeRedeem} initialCode={linkedCode} />
+      <BuyGiftcardsDialog open={buying} onOpenChange={setBuying} />
     </div>
   );
 }

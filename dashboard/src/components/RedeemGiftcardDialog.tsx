@@ -9,9 +9,16 @@ import { Label } from '@/components/ui/label';
 import { useRedeemGiftcard } from '@/hooks/useCredits';
 import { usd } from '@/lib/format';
 
-export function RedeemGiftcardDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+interface RedeemGiftcardDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** A code to start with, from a gift card's link. */
+  initialCode?: string;
+}
+
+export function RedeemGiftcardDialog({ open, onOpenChange, initialCode = '' }: RedeemGiftcardDialogProps) {
   const redeem = useRedeemGiftcard();
-  const [code, setCode] = useState('');
+  const [code, setCode] = useState(initialCode);
 
   const close = (open: boolean) => {
     onOpenChange(open);

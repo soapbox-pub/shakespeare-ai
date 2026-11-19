@@ -6,6 +6,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useGenerations } from '@/hooks/useCredits';
+import { useKeys } from '@/hooks/useKeys';
 import { dateTime, tokens, usd } from '@/lib/format';
 
 export default function UsagePage() {
@@ -20,6 +21,8 @@ export default function UsagePage() {
 function Usage() {
   const generations = useGenerations();
   const rows = generations.data?.pages.flatMap((page) => page.data) ?? [];
+  const keys = useKeys();
+  const keyNames = new Map(keys.data?.pages.flatMap((page) => page.data).map((key) => [key.id, key.name || key.label]));
 
   return (
     <div className="space-y-6">
@@ -40,6 +43,7 @@ function Usage() {
               <TableRow>
                 <TableHead>Date</TableHead>
                 <TableHead>Model</TableHead>
+                <TableHead className="hidden md:table-cell">Via</TableHead>
                 <TableHead className="hidden text-right sm:table-cell">Input</TableHead>
                 <TableHead className="hidden text-right sm:table-cell">Output</TableHead>
                 <TableHead className="text-right">Cost</TableHead>
@@ -51,6 +55,9 @@ function Usage() {
                   <TableCell className="whitespace-nowrap">{dateTime(generation.created)}</TableCell>
                   <TableCell>
                     <code className="text-xs">{generation.model}</code>
+                  </TableCell>
+                  <TableCell className="hidden text-muted-foreground md:table-cell">
+                    {generation.api_key_id ? (keyNames.get(generation.api_key_id) ?? 'An API key') : 'Nostr'}
                   </TableCell>
                   <TableCell className="hidden text-right tabular-nums sm:table-cell">{tokens(generation.usage.prompt_tokens)}</TableCell>
                   <TableCell className="hidden text-right tabular-nums sm:table-cell">{tokens(generation.usage.completion_tokens)}</TableCell>

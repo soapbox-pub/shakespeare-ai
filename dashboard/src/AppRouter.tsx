@@ -8,6 +8,7 @@ import HomePage from "./pages/HomePage";
 // The pages behind a login are chunks of their own, so the landing page
 // loads only what it shows.
 const CreditsPage = lazy(() => import("./pages/CreditsPage"));
+const KeysPage = lazy(() => import("./pages/KeysPage"));
 const UsagePage = lazy(() => import("./pages/UsagePage"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 
@@ -19,6 +20,7 @@ export function AppRouter() {
         <Route element={<Layout />}>
           <Route path="/" element={<HomePage />} />
           <Route path="/credits" element={<CreditsPage />} />
+          <Route path="/keys" element={<KeysPage />} />
           <Route path="/usage" element={<UsagePage />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />

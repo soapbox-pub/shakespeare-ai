@@ -36,6 +36,47 @@ export interface Generation {
   cost: number;
   /** Tokens counted from bytes, because the client hung up before the provider reported them. */
   estimated: boolean;
+  /** The API key that made it, or null when the request was signed with NIP-98. */
+  api_key_id: string | null;
+}
+
+export type LimitReset = 'daily' | 'weekly' | 'monthly';
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  /** The key's first and last few characters, to recognize it by. */
+  label: string;
+  disabled: boolean;
+  /** Credits it may spend, per `limit_reset` period or ever; null for no limit. */
+  limit: number | null;
+  limit_reset: LimitReset | null;
+  limit_remaining: number | null;
+  usage: number;
+  usage_daily: number;
+  usage_weekly: number;
+  usage_monthly: number;
+  created_at: number;
+  updated_at: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+}
+
+/** What a key can be made or changed with. Absent leaves a field alone; null clears it. */
+export interface ApiKeyChanges {
+  name?: string;
+  disabled?: boolean;
+  limit?: number | null;
+  limit_reset?: LimitReset | null;
+  expires_at?: number | null;
+}
+
+export interface Giftcard {
+  id: string;
+  code: string;
+  amount: number;
+  status: 'active' | 'redeemed' | 'cancelled';
+  created_at: number;
 }
 
 export interface Model {
@@ -103,6 +144,7 @@ export class ApiClient {
 
     const response = await fetch(url, { method, headers, body: payload });
     if (!response.ok) throw await apiError(response);
+    if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
   }
 
@@ -129,11 +171,43 @@ export class ApiClient {
   redeemGiftcard(code: string): Promise<{ amount: number }> {
     return this.request('POST', '/v1/credits/giftcards/redeem', { code });
   }
+
+  giftcards(after?: string): Promise<List<Giftcard>> {
+    // This list's cursor has always been called `min_id`.
+    return this.request('GET', `/v1/credits/giftcards${page(after, 'min_id')}`);
+  }
+
+  /** Paid for from the balance. */
+  createGiftcards(input: { amount: number; quantity: number }): Promise<{ data: Giftcard[] }> {
+    return this.request('POST', '/v1/credits/giftcards', input);
+  }
+
+  /** Cancel an unredeemed card, refunding it to the balance. */
+  cancelGiftcard(id: string): Promise<void> {
+    return this.request('DELETE', `/v1/credits/giftcards/${encodeURIComponent(id)}`);
+  }
+
+  keys(after?: string): Promise<List<ApiKey>> {
+    return this.request('GET', `/v1/keys${page(after, 'starting_after', 100)}`);
+  }
+
+  /** The response's `key` is the only time the key itself is ever shown. */
+  createKey(input: ApiKeyChanges): Promise<ApiKey & { key: string }> {
+    return this.request('POST', '/v1/keys', input);
+  }
+
+  updateKey(id: string, changes: ApiKeyChanges): Promise<ApiKey> {
+    return this.request('PATCH', `/v1/keys/${encodeURIComponent(id)}`, changes);
+  }
+
+  revokeKey(id: string): Promise<ApiKey> {
+    return this.request('DELETE', `/v1/keys/${encodeURIComponent(id)}`);
+  }
 }
 
-function page(startingAfter: string | undefined): string {
-  const params = new URLSearchParams({ limit: '50' });
-  if (startingAfter) params.set('starting_after', startingAfter);
+function page(after: string | undefined, cursor = 'starting_after', limit = 50): string {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set(cursor, after);
   return `?${params}`;
 }
 
