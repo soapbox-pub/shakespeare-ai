@@ -16,7 +16,9 @@ use crate::api::{self, ApiError};
 use crate::config::Config;
 use crate::db::Db;
 use crate::metrics::Metrics;
+use crate::money::Money;
 use crate::payments::rates::Rates;
+use crate::store::{self, ApiKey, Unusable};
 
 pub struct App {
     pub config: Config,
@@ -39,14 +41,83 @@ impl App {
         Ok(App { config, db, http, rates: Rates::default(), metrics: Metrics::default(), limiter: RateLimiter::default() })
     }
 
-    /// The pubkey a request's NIP-98 header was signed by.
+    /// The pubkey a request's NIP-98 header was signed by. Only NIP-98 will
+    /// do: API keys are for inference, not for managing an account.
     pub fn authenticate(&self, method: &Method, uri: &axum::http::Uri, headers: &HeaderMap, body: &[u8]) -> Result<String, ApiError> {
         let header = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok());
+        if header.is_some_and(|h| bearer_token(h).is_some()) {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "nip98_required",
+                "API keys can only be used for inference. Sign this request with NIP-98.",
+            ));
+        }
         let path_and_query = uri.path_and_query().map_or("/", |p| p.as_str());
         let host = self.config.origin.host_str().unwrap_or_default();
         crate::nostr::verify_nip98(header, method.as_str(), path_and_query, body, host, crate::util::now())
             .map_err(|message| ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid_authorization", message))
     }
+
+    /// Who's paying for an inference request: an API key's owner, if it
+    /// carries `Authorization: Bearer <key>`, or else whoever signed it with
+    /// NIP-98.
+    pub async fn authenticate_inference(&self, method: &Method, uri: &axum::http::Uri, headers: &HeaderMap, body: &[u8]) -> Result<Caller, ApiError> {
+        let header = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok());
+        let Some(token) = header.and_then(bearer_token) else {
+            return Ok(Caller { pubkey: self.authenticate(method, uri, headers, body)?, api_key: None });
+        };
+        let error = |code: &str, message: &str| ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", code, message);
+        let token = token.to_string();
+        let key = self.db.call(move |conn| store::api_key_by_token(conn, &token)).await?.ok_or_else(|| error("invalid_api_key", "Invalid API key"))?;
+        match key.unusable(crate::util::now()) {
+            None => Ok(Caller { pubkey: key.pubkey.clone(), api_key: Some(key) }),
+            Some(Unusable::Revoked) => Err(error("api_key_revoked", "This API key has been revoked")),
+            Some(Unusable::Disabled) => Err(error("api_key_disabled", "This API key is disabled")),
+            Some(Unusable::Expired) => Err(error("api_key_expired", "This API key has expired")),
+        }
+    }
+
+    /// Refuse a request an API key's spend limit can't cover: `needed` more
+    /// than it has left, or nothing left at all. NIP-98 has no limit.
+    pub async fn check_key_limit(&self, caller: &Caller, needed: Money) -> Result<(), ApiError> {
+        let Some(key) = &caller.api_key else { return Ok(()) };
+        let Some(limit) = key.limit else { return Ok(()) };
+        let (id, since) = (key.id.clone(), key.limit_since(crate::util::now()));
+        let spent = self.db.call(move |conn| store::api_key_spent(conn, &id, since)).await?;
+        let remaining = Money(limit.nanos().saturating_sub(spent.nanos()).max(0));
+        if !remaining.is_positive() || remaining < needed {
+            let period = key.limit_reset.map_or(String::new(), |r| format!(" {}", r.as_str()));
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "insufficient_quota",
+                "key_limit_exceeded",
+                format!("This API key has reached its{period} spending limit of {} credits", limit.to_f64()),
+            )
+            .with("limit", limit.to_f64())
+            .with("limit_remaining", remaining.to_f64()));
+        }
+        Ok(())
+    }
+}
+
+/// Who an inference request is from, and the key it came with, if any.
+pub struct Caller {
+    pub pubkey: String,
+    pub api_key: Option<ApiKey>,
+}
+
+impl Caller {
+    pub fn api_key_id(&self) -> Option<String> {
+        self.api_key.as_ref().map(|k| k.id.clone())
+    }
+}
+
+/// The token in `Bearer <token>`, if that's what the header is. An empty one
+/// is no key at all: the OpenAI SDK sends `Bearer ` when given none.
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    Some(token.trim()).filter(|t| scheme.eq_ignore_ascii_case("bearer") && !t.is_empty())
 }
 
 /// Chat requests carry whole conversations, images included.
@@ -71,6 +142,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/credits/giftcards/check/{code}", get(api::giftcards::check))
         .route("/v1/credits/giftcards/{giftcard_id}", get(api::giftcards::get).delete(api::giftcards::cancel))
         .route("/v1/credits/generations", get(api::credits::list_generations))
+        .route("/v1/keys", post(api::keys::create).get(api::keys::list))
+        .route("/v1/keys/{key_id}", get(api::keys::get).patch(api::keys::update).delete(api::keys::revoke))
         .route("/webhooks/stripe", post(api::credits::stripe_webhook))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "invalid_request_error", "not_found", "Not found") })
         .layer(DefaultBodyLimit::max(MAX_BODY))

@@ -227,7 +227,7 @@
         >https://ai.shakespeare.diy/v1</code><br>
         <strong>Authentication:</strong> <a
           href="https://github.com/nostr-protocol/nips/blob/master/98.md"
-        >Nostr NIP-98</a>
+        >Nostr NIP-98</a>, or an API key for inference
       </div>
 
       <div class="toc">
@@ -237,17 +237,28 @@
           <li><a href="#models">Models</a></li>
           <li><a href="#chat-completions">Chat Completions</a></li>
           <li><a href="#credit-management">Credit Management</a></li>
+          <li><a href="#api-keys">API Keys</a></li>
           <li><a href="#error-handling">Error Handling</a></li>
         </ul>
       </div>
 
       <h2 id="authentication">Authentication</h2>
       <p>
-        Shakespeare AI uses Nostr NIP-98 authentication instead of traditional
-        API keys. All requests must be signed using your Nostr private key.
+        Shakespeare AI uses Nostr NIP-98 authentication: each request is signed
+        with your Nostr private key. For inference (chat completions and image
+        generations) you can instead use an <a href="#api-keys">API key</a>,
+        made with NIP-98, that spends your credits.
       </p>
 
-      <h3>Using with OpenAI SDK</h3>
+      <h3>Using with OpenAI SDK and an API key</h3>
+      <div class="code-block">import OpenAI from "openai";
+
+const openai = new OpenAI({
+  baseURL: "https://ai.shakespeare.diy/v1",
+  apiKey: "sk-shakespeare-...",
+});</div>
+
+      <h3>Using with OpenAI SDK and NIP-98</h3>
       <div class="code-block">import { NIP98Client } from "@nostrify/nostrify";
 import OpenAI from "openai";
 
@@ -538,6 +549,154 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
           </tr>
         </tbody>
       </table>
+
+      <h2 id="api-keys">API Keys</h2>
+
+      <div class="warning">
+        <strong>Note:</strong> API keys work only for
+        <code>/v1/chat/completions</code> and
+        <code>/v1/images/generations</code>, sent as
+        <code>Authorization: Bearer &lt;key&gt;</code>. Managing keys, and
+        everything else, requires NIP-98, so a leaked key can only spend up to
+        its limit.
+      </div>
+
+      <p>
+        A key spends the credits of the Nostr account that made it. Its
+        generations appear in <code>/v1/credits/generations</code> with its
+        <code>api_key_id</code>. An account can have up to 100 keys that
+        haven't been revoked.
+      </p>
+
+      <h3>Create API Key</h3>
+      <div class="endpoint">
+        <span class="method">POST</span> <span class="url">/v1/keys</span>
+      </div>
+
+      <p>
+        Creates a key. Every field is optional, and the body may be empty. The
+        response's <code>key</code> is shown only this once: store it safely.
+      </p>
+
+      <h4>Request Body</h4>
+      <table class="response-table">
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>Type</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>name</code></td>
+            <td>string</td>
+            <td>A name for the key, up to 100 characters</td>
+          </tr>
+          <tr>
+            <td><code>limit</code></td>
+            <td>number | null</td>
+            <td>The most credits the key may spend (default: no limit)</td>
+          </tr>
+          <tr>
+            <td><code>limit_reset</code></td>
+            <td>string | null</td>
+            <td>
+              When the limit starts again: daily, weekly or monthly (at
+              midnight UTC, Mondays, or the 1st). Without one, the limit is for
+              the key's lifetime.
+            </td>
+          </tr>
+          <tr>
+            <td><code>expires_at</code></td>
+            <td>integer | null</td>
+            <td>When the key stops working, in Unix seconds</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4>Example Response</h4>
+      <div class="code-block">{
+  "object": "api_key",
+  "id": "key_3f9a1c0b7e2d4a6f8b1c2d3e",
+  "name": "My bot",
+  "label": "sk-shakespeare-1a2b...9f8e",
+  "disabled": false,
+  "limit": 5.0,
+  "limit_reset": "monthly",
+  "limit_remaining": 5.0,
+  "usage": 0.0,
+  "usage_daily": 0.0,
+  "usage_weekly": 0.0,
+  "usage_monthly": 0.0,
+  "created_at": 1795100645,
+  "updated_at": 1795100645,
+  "expires_at": null,
+  "revoked_at": null,
+  "key": "sk-shakespeare-1a2b(56 more hex characters)9f8e"
+}</div>
+
+      <h3>List API Keys</h3>
+      <div class="endpoint">
+        <span class="method">GET</span> <span class="url">/v1/keys</span>
+      </div>
+
+      <p>
+        Lists your keys, newest first, revoked ones included, with
+        <code>limit</code> and <code>starting_after</code> for pagination as
+        for payments. Each is as above, without <code>key</code>.
+      </p>
+
+      <h3>Get API Key</h3>
+      <div class="endpoint">
+        <span class="method">GET</span> <span class="url"
+        >/v1/keys/{key_id}</span>
+      </div>
+
+      <h3>Update API Key</h3>
+      <div class="endpoint">
+        <span class="method">PATCH</span> <span class="url"
+        >/v1/keys/{key_id}</span>
+      </div>
+
+      <p>
+        Changes any of <code>name</code>, <code>limit</code>,
+        <code>limit_reset</code>, <code>expires_at</code> and
+        <code>disabled</code> (true or false). Fields left out stay as they
+        are; <code>null</code> clears a limit, its reset or an expiry.
+      </p>
+
+      <h3>Revoke API Key</h3>
+      <div class="endpoint">
+        <span class="method">DELETE</span> <span class="url"
+        >/v1/keys/{key_id}</span>
+      </div>
+
+      <p>
+        Revokes a key permanently. It stays in the list, with
+        <code>revoked_at</code> set, and can't be changed or used again.
+      </p>
+
+      <h3>API Key Error Codes</h3>
+      <ul>
+        <li><code>invalid_api_key</code> (401) - The key doesn't exist</li>
+        <li>
+          <code>api_key_disabled</code>, <code>api_key_expired</code>,
+          <code>api_key_revoked</code> (401) - The key can't be used now
+        </li>
+        <li>
+          <code>key_limit_exceeded</code> (429) - The key has reached its
+          spending limit
+        </li>
+        <li>
+          <code>nip98_required</code> (401) - An API key was used for something
+          other than inference
+        </li>
+        <li><code>api_key_not_found</code> (404) - No such key of yours</li>
+        <li>
+          <code>too_many_api_keys</code> - Revoke a key to make another
+        </li>
+      </ul>
 
       <h2 id="error-handling">Error Handling</h2>
 

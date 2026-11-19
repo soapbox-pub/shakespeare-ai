@@ -381,3 +381,133 @@ async fn sells_credits_for_onchain_bitcoin() {
     assert_eq!(list["data"].as_array().unwrap().len(), 2);
     assert_eq!(list["data"][0]["description"], "Credit purchase via Bitcoin");
 }
+
+fn with_key(method: &str, path: &str, key: &str, body: Option<Value>) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(body.map_or_else(Body::empty, |b| Body::from(serde_json::to_vec(&b).unwrap())))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn api_keys_spend_their_owners_credit_within_their_limits() {
+    let (app, _t) = setup().await;
+    let call = |request| {
+        let app = app.clone();
+        async move { json_of(router(app).oneshot(request).await.unwrap()).await }
+    };
+    let chat = json!({ "model": "paid", "messages": [{ "role": "user", "content": "hi" }] });
+
+    // Made with NIP-98, with no body at all.
+    let (status, created) = call(signed("POST", "/v1/keys", None)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let key = created["key"].as_str().unwrap().to_string();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert!(key.starts_with("sk-shakespeare-") && key.len() == 15 + 64, "{key}");
+    assert_eq!(created["label"], format!("sk-shakespeare-{}...{}", &key[15..19], &key[key.len() - 4..]));
+    assert_eq!((&created["limit"], &created["usage"]), (&Value::Null, &json!(0.0)));
+
+    // It spends its owner's credit.
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("insufficient_quota")));
+    give(&app, 1);
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(balance(&app), Money(1_000_000_000 - 18_000_000));
+    let (_, generations) = call(signed("GET", "/v1/credits/generations", None)).await;
+    assert_eq!(generations["data"][0]["api_key_id"], id.as_str());
+
+    // But it's for inference only.
+    for (method, path) in [("GET", "/v1/credits"), ("GET", "/v1/keys"), ("POST", "/v1/keys"), ("DELETE", &*format!("/v1/keys/{id}"))] {
+        let (status, body) = call(with_key(method, path, &key, None)).await;
+        assert_eq!((status, &body["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("nip98_required")), "{method} {path}");
+    }
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", "sk-shakespeare-nope", Some(chat.clone()))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("invalid_api_key")));
+
+    // A limit counts what it has already spent.
+    let path = format!("/v1/keys/{id}");
+    let (status, body) = call(signed("PATCH", &path, Some(json!({ "name": "bot", "limit": 0.02, "limit_reset": "daily" })))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((&body["name"], &body["limit"], &body["limit_reset"]), (&json!("bot"), &json!(0.02), &json!("daily")));
+    assert_eq!((&body["usage"], &body["usage_daily"], &body["limit_remaining"]), (&json!(0.018), &json!(0.018), &json!(0.002)));
+    // $0.002 left: enough to start a chat, not two images.
+    let (status, _) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("key_limit_exceeded")));
+    let (status, body) = call(signed("PATCH", &path, Some(json!({ "limit": null })))).await;
+    assert_eq!((status, &body["limit_remaining"]), (StatusCode::OK, &Value::Null));
+    let images = json!({ "model": "gpt-image-1", "prompt": "a cat", "n": 2, "quality": "medium", "size": "1024x1024" });
+    call(signed("PATCH", &path, Some(json!({ "limit": 0.1, "limit_reset": null })))).await;
+    let (status, body) = call(with_key("POST", "/v1/images/generations", &key, Some(images.clone()))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("key_limit_exceeded")), "{body}");
+    call(signed("PATCH", &path, Some(json!({ "limit": 1 })))).await;
+    let (status, body) = call(with_key("POST", "/v1/images/generations", &key, Some(images))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Free models cost nothing, so a spent limit doesn't stop them.
+    call(signed("PATCH", &path, Some(json!({ "limit": 0 })))).await;
+    let (status, _) = call(with_key("POST", "/v1/chat/completions", &key, Some(json!({ "model": "free", "messages": chat["messages"] })))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Disabled, then enabled, then revoked for good.
+    call(signed("PATCH", &path, Some(json!({ "limit": null, "disabled": true })))).await;
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("api_key_disabled")));
+    call(signed("PATCH", &path, Some(json!({ "disabled": false })))).await;
+    let (status, _) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(signed("DELETE", &path, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["revoked_at"].is_i64());
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", &key, Some(chat.clone()))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("api_key_revoked")));
+    let (status, body) = call(signed("PATCH", &path, Some(json!({ "disabled": false })))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("api_key_revoked")));
+
+    // Listed still, with what it spent; and nobody else's to see.
+    let (_, list) = call(signed("GET", "/v1/keys", None)).await;
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
+    assert!(list["data"][0]["usage"].as_f64().unwrap() > 0.1);
+    assert!(list["data"][0].get("key").is_none());
+    let other = "0000000000000000000000000000000000000000000000000000000000000008";
+    let auth = sign_nip98(other, "GET", &format!("https://ai.example.com{path}"), None, crate::util::now());
+    let request = Request::builder().uri(&path).header("authorization", auth).body(Body::empty()).unwrap();
+    let (status, body) = call(request).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::NOT_FOUND, &json!("api_key_not_found")));
+}
+
+#[tokio::test]
+async fn validates_api_keys() {
+    let (app, _t) = setup().await;
+    let call = |request| {
+        let app = app.clone();
+        async move { json_of(router(app).oneshot(request).await.unwrap()).await }
+    };
+    for (body, param) in [
+        (json!({ "limit": -1 }), "limit"),
+        (json!({ "limit": "5" }), "limit"),
+        (json!({ "limit_reset": "hourly" }), "limit_reset"),
+        (json!({ "expires_at": 1 }), "expires_at"),
+        (json!({ "name": "x".repeat(101) }), "name"),
+        (json!({ "disabled": true }), "disabled"),
+        (json!({ "scopes": [] }), "scopes"),
+    ] {
+        let (status, error) = call(signed("POST", "/v1/keys", Some(body.clone()))).await;
+        assert_eq!((status, &error["error"]["param"]), (StatusCode::BAD_REQUEST, &json!(param)), "{body}");
+    }
+
+    let soon = crate::util::now() + 3600;
+    let (status, created) = call(signed("POST", "/v1/keys", Some(json!({ "name": "ci", "expires_at": soon })))).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!((&created["name"], &created["expires_at"]), (&json!("ci"), &json!(soon)));
+    // Past its expiry, it's refused.
+    app.db.with(|conn| Ok(conn.execute("UPDATE api_keys SET expires_at = 1", [])?)).unwrap();
+    let chat = json!({ "model": "free", "messages": [] });
+    let (status, body) = call(with_key("POST", "/v1/chat/completions", created["key"].as_str().unwrap(), Some(chat))).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("api_key_expired")));
+}

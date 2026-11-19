@@ -1,8 +1,9 @@
 # Shakespeare AI
 
-An OpenAI-compatible AI provider that authenticates with Nostr (NIP-98)
-instead of API keys, and bills prepaid credits bought by card (Stripe),
-Lightning or onchain bitcoin. It serves `https://ai.shakespeare.diy/v1`.
+An OpenAI-compatible AI provider that authenticates with Nostr (NIP-98), and
+bills prepaid credits bought by card (Stripe), Lightning or onchain bitcoin.
+It serves `https://ai.shakespeare.diy/v1`. API keys made with NIP-98 let any
+OpenAI client use it with just a base URL and a key.
 
 This is the Rust rewrite of the Deno service (`soapbox-pub/shakespeare-ai`).
 Its API is the same, so clients don't change; see "Differences" below for what
@@ -90,6 +91,35 @@ default; 0 trusts the mempool, where a payment can still be double-spent).
 - Don't use the key for anything else that hands out receive addresses, or
   the two will reuse each other's.
 
+## API keys
+
+`POST /v1/keys` makes a key (`sk-shakespeare-…`) for whoever signed the
+request. It works as `Authorization: Bearer <key>` on the inference endpoints,
+`/v1/chat/completions` and `/v1/images/generations`, and nowhere else, so an
+OpenAI SDK needs only `baseURL` and `apiKey`. What it spends comes from its
+owner's balance, and its generations are listed with the owner's, marked with
+its `api_key_id`.
+
+Keys are managed with NIP-98 only: a key can't list, make or change keys, or
+touch credit, so a leaked one can do no more than spend up to its limit.
+
+- `POST /v1/keys`: `name`, `limit` (credits), `limit_reset` (`daily`,
+  `weekly`, `monthly` or `null` for a lifetime limit) and `expires_at` (Unix
+  seconds), all optional. The response's `key` is the only time the key is
+  shown; only its sha256 is stored.
+- `GET /v1/keys`, `GET /v1/keys/{id}`: each key with its `label`, limit,
+  `limit_remaining`, and `usage` ever, today, this week and this month.
+  Periods start at midnight UTC, on Mondays and on the 1st.
+- `PATCH /v1/keys/{id}`: any of the above, plus `disabled`. `null` clears a
+  limit, its reset or an expiry.
+- `DELETE /v1/keys/{id}`: revokes it, for good. It stays listed, with
+  `revoked_at`.
+
+Like a balance, a limit is checked before a request and charged after it, so
+a key can end a little past its limit, and concurrent requests can each pass
+the check. Images are checked against the most they could cost. An account can
+have 100 keys that aren't revoked.
+
 ## Storage
 
 SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
@@ -102,6 +132,8 @@ SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
 - `payments`, `giftcards` and `generations` are the records behind the
   entries. `bitcoin_addresses` holds each bitcoin payment's address, its
   derivation index and the sats it's owed.
+- `api_keys` holds each key's hash, owner, limit and state. A key's spend is
+  the sum of its generations' costs, so there's no counter to drift.
 
 Anything that releases money (a payment completing, a gift card being
 redeemed or cancelled) is one conditional `UPDATE … RETURNING`, and credit

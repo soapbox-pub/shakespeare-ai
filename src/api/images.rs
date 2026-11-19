@@ -20,7 +20,8 @@ const SIZES: &[&str] = &["1024x1024", "1024x1536", "1536x1024", "auto"];
 const FORMATS: &[&str] = &["png", "jpeg", "webp"];
 
 pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
-    let pubkey = app.authenticate(&method, &uri, &headers, &body)?;
+    let caller = app.authenticate_inference(&method, &uri, &headers, &body).await?;
+    let pubkey = caller.pubkey.clone();
     let request = super::json_object(&body)?;
     let params = Params::parse(&request)?;
 
@@ -37,6 +38,7 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     // have: without a quality it picks one itself.
     let n = params.n.unwrap_or(1);
     let most = per_image(price, params.quality.as_deref().unwrap_or("high"), params.size.as_deref()).checked_mul(i64::from(n)).unwrap_or(Money(i64::MAX));
+    app.check_key_limit(&caller, most).await?;
     let who = pubkey.clone();
     let balance = app.db.call(move |conn| store::balance(conn, &who)).await?;
     if balance < most {
@@ -84,11 +86,12 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         completion_tokens: u64::from(made),
         cost,
         estimated: false,
+        api_key_id: caller.api_key_id(),
     };
     let id = generation.id.clone();
     app.metrics.usage(&params.model, 0, u64::from(made), cost);
     let recorded = app.db.call(move |conn| store::record_generation(conn, &generation)).await;
-    let fields = json!({ "pubkey": pubkey, "model": params.model, "cost": cost.to_f64(), "images": made, "quality": quality, "size": size, "id": id });
+    let fields = json!({ "pubkey": pubkey, "api_key": caller.api_key_id(), "model": params.model, "cost": cost.to_f64(), "images": made, "quality": quality, "size": size, "id": id });
     match recorded {
         Ok(()) => crate::log::info("image.generation", fields),
         Err(error) => crate::log::error("image.unrecorded", json!({ "generation": fields, "error": format!("{error:#}") })),

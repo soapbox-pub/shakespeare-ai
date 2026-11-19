@@ -4,6 +4,7 @@ pub mod chat;
 pub mod credits;
 pub mod giftcards;
 pub mod images;
+pub mod keys;
 pub mod models;
 
 use axum::http::StatusCode;

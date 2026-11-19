@@ -407,6 +407,8 @@ pub struct Generation {
     pub completion_tokens: u64,
     pub cost: Money,
     pub estimated: bool,
+    /// The API key it was made with, if it wasn't signed for with NIP-98.
+    pub api_key_id: Option<String>,
 }
 
 pub fn new_generation_id() -> String {
@@ -417,8 +419,8 @@ pub fn new_generation_id() -> String {
 pub fn record_generation(conn: &mut Connection, g: &Generation) -> Result<()> {
     let tx = write_tx(conn)?;
     tx.execute(
-        "INSERT INTO generations (id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO generations (id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated, api_key_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             g.id,
             g.upstream_id,
@@ -428,7 +430,8 @@ pub fn record_generation(conn: &mut Connection, g: &Generation) -> Result<()> {
             g.prompt_tokens as i64,
             g.completion_tokens as i64,
             g.cost.nanos(),
-            g.estimated
+            g.estimated,
+            g.api_key_id
         ],
     )?;
     if g.cost.is_positive() {
@@ -442,7 +445,7 @@ pub fn list_generations(conn: &Connection, pubkey: &str, limit: usize, after: Op
     let cursor = after.map(|id| cursor_of(conn, "generations", "pubkey", pubkey, id)).transpose()?.flatten();
     let (after_time, after_id) = cursor.unzip();
     let mut stmt = conn.prepare_cached(
-        "SELECT id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated FROM generations
+        "SELECT id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated, api_key_id FROM generations
          WHERE pubkey = ?1 AND (?2 IS NULL OR (created_at, id) < (?2, ?3)) ORDER BY created_at DESC, id DESC LIMIT ?4",
     )?;
     let rows = stmt.query_map(params![pubkey, after_time, after_id, limit as i64 + 1], |r| {
@@ -456,9 +459,282 @@ pub fn list_generations(conn: &Connection, pubkey: &str, limit: usize, after: Op
             completion_tokens: r.get::<_, i64>(6)? as u64,
             cost: Money(r.get(7)?),
             estimated: r.get(8)?,
+            api_key_id: r.get(9)?,
         })
     })?;
     page(rows.collect::<rusqlite::Result<Vec<_>>>()?, limit)
+}
+
+// API keys.
+
+/// How often a key's spend limit starts again: at midnight UTC, on Mondays,
+/// or on the 1st of the month.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitReset {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl LimitReset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LimitReset::Daily => "daily",
+            LimitReset::Weekly => "weekly",
+            LimitReset::Monthly => "monthly",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LimitReset> {
+        match s {
+            "daily" => Some(LimitReset::Daily),
+            "weekly" => Some(LimitReset::Weekly),
+            "monthly" => Some(LimitReset::Monthly),
+            _ => None,
+        }
+    }
+
+    /// When the period containing `now` began.
+    pub fn period_start(self, now: i64) -> i64 {
+        match self {
+            LimitReset::Daily => crate::util::day_start(now),
+            LimitReset::Weekly => crate::util::week_start(now),
+            LimitReset::Monthly => crate::util::month_start(now),
+        }
+    }
+}
+
+/// What every API key starts with; the rest is random.
+pub const API_KEY_PREFIX: &str = "sk-shakespeare-";
+
+/// The most keys one account may have that aren't revoked.
+pub const MAX_API_KEYS: i64 = 100;
+
+#[derive(Clone, Debug)]
+pub struct ApiKey {
+    pub id: String,
+    pub pubkey: String,
+    pub label: String,
+    pub name: String,
+    pub disabled: bool,
+    pub limit: Option<Money>,
+    pub limit_reset: Option<LimitReset>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+impl ApiKey {
+    /// Why it can't be used now, if it can't.
+    pub fn unusable(&self, now: i64) -> Option<Unusable> {
+        if self.revoked_at.is_some() {
+            Some(Unusable::Revoked)
+        } else if self.disabled {
+            Some(Unusable::Disabled)
+        } else if self.expires_at.is_some_and(|at| at <= now) {
+            Some(Unusable::Expired)
+        } else {
+            None
+        }
+    }
+
+    /// When the spend that counts against its limit began: the start of the
+    /// current period, or forever.
+    pub fn limit_since(&self, now: i64) -> i64 {
+        self.limit_reset.map_or(i64::MIN, |reset| reset.period_start(now))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unusable {
+    Revoked,
+    Disabled,
+    Expired,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApiKeyError {
+    NotFound,
+    Revoked,
+    TooMany,
+}
+
+/// A key's spend: ever, and since the start of today, this week and this
+/// month (UTC).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApiKeyUsage {
+    pub total: Money,
+    pub daily: Money,
+    pub weekly: Money,
+    pub monthly: Money,
+}
+
+const API_KEY_COLUMNS: &str = "id, pubkey, label, name, disabled, spend_limit, limit_reset, created_at, updated_at, expires_at, revoked_at";
+
+fn api_key_row(row: &rusqlite::Row) -> rusqlite::Result<ApiKey> {
+    Ok(ApiKey {
+        id: row.get(0)?,
+        pubkey: row.get(1)?,
+        label: row.get(2)?,
+        name: row.get(3)?,
+        disabled: row.get(4)?,
+        limit: row.get::<_, Option<i64>>(5)?.map(Money),
+        limit_reset: row.get::<_, Option<String>>(6)?.as_deref().and_then(LimitReset::parse),
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        revoked_at: row.get(10)?,
+    })
+}
+
+pub fn hash_api_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+pub struct NewApiKey {
+    pub name: String,
+    pub limit: Option<Money>,
+    pub limit_reset: Option<LimitReset>,
+    pub expires_at: Option<i64>,
+}
+
+/// Make a key for `pubkey`: the key as stored, and the secret itself, which
+/// is never seen again.
+pub fn create_api_key(conn: &mut Connection, pubkey: &str, new: NewApiKey, now: i64) -> Result<Result<(ApiKey, String), ApiKeyError>> {
+    let tx = write_tx(conn)?;
+    let count: i64 = tx.query_row("SELECT COUNT(*) FROM api_keys WHERE pubkey = ? AND revoked_at IS NULL", [pubkey], |r| r.get(0))?;
+    if count >= MAX_API_KEYS {
+        return Ok(Err(ApiKeyError::TooMany));
+    }
+    let secret = random_hex(64);
+    let token = format!("{API_KEY_PREFIX}{secret}");
+    let key = ApiKey {
+        id: format!("key_{}", random_hex(24)),
+        pubkey: pubkey.to_string(),
+        label: format!("{API_KEY_PREFIX}{}...{}", &secret[..4], &secret[secret.len() - 4..]),
+        name: new.name,
+        disabled: false,
+        limit: new.limit,
+        limit_reset: new.limit_reset,
+        created_at: now,
+        updated_at: now,
+        expires_at: new.expires_at,
+        revoked_at: None,
+    };
+    tx.execute(
+        "INSERT INTO api_keys (id, pubkey, hash, label, name, spend_limit, limit_reset, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            key.id,
+            key.pubkey,
+            hash_api_key(&token),
+            key.label,
+            key.name,
+            key.limit.map(Money::nanos),
+            key.limit_reset.map(LimitReset::as_str),
+            now,
+            now,
+            key.expires_at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Ok((key, token)))
+}
+
+/// The key a bearer token is, whatever its state.
+pub fn api_key_by_token(conn: &Connection, token: &str) -> Result<Option<ApiKey>> {
+    if !token.starts_with(API_KEY_PREFIX) {
+        return Ok(None);
+    }
+    let sql = format!("SELECT {API_KEY_COLUMNS} FROM api_keys WHERE hash = ?");
+    Ok(conn.query_row(&sql, [hash_api_key(token)], api_key_row).optional()?)
+}
+
+pub fn get_api_key(conn: &Connection, pubkey: &str, id: &str) -> Result<Option<ApiKey>> {
+    let sql = format!("SELECT {API_KEY_COLUMNS} FROM api_keys WHERE id = ? AND pubkey = ?");
+    Ok(conn.query_row(&sql, [id, pubkey], api_key_row).optional()?)
+}
+
+pub fn list_api_keys(conn: &Connection, pubkey: &str, limit: usize, after: Option<&str>) -> Result<(Vec<ApiKey>, bool)> {
+    let cursor = after.map(|id| cursor_of(conn, "api_keys", "pubkey", pubkey, id)).transpose()?.flatten();
+    let (after_time, after_id) = cursor.unzip();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {API_KEY_COLUMNS} FROM api_keys WHERE pubkey = ?1 AND (?2 IS NULL OR (created_at, id) < (?2, ?3))
+         ORDER BY created_at DESC, id DESC LIMIT ?4"
+    ))?;
+    let rows = stmt.query_map(params![pubkey, after_time, after_id, limit as i64 + 1], api_key_row)?;
+    page(rows.collect::<rusqlite::Result<Vec<_>>>()?, limit)
+}
+
+/// Changes to a key; `None` leaves a field as it is.
+#[derive(Default)]
+pub struct ApiKeyChanges {
+    pub name: Option<String>,
+    pub disabled: Option<bool>,
+    pub limit: Option<Option<Money>>,
+    pub limit_reset: Option<Option<LimitReset>>,
+    pub expires_at: Option<Option<i64>>,
+}
+
+pub fn update_api_key(conn: &mut Connection, pubkey: &str, id: &str, changes: ApiKeyChanges, now: i64) -> Result<Result<ApiKey, ApiKeyError>> {
+    let tx = write_tx(conn)?;
+    let Some(mut key) = get_api_key(&tx, pubkey, id)? else {
+        return Ok(Err(ApiKeyError::NotFound));
+    };
+    if key.revoked_at.is_some() {
+        return Ok(Err(ApiKeyError::Revoked));
+    }
+    if let Some(name) = changes.name {
+        key.name = name;
+    }
+    if let Some(disabled) = changes.disabled {
+        key.disabled = disabled;
+    }
+    if let Some(limit) = changes.limit {
+        key.limit = limit;
+    }
+    if let Some(reset) = changes.limit_reset {
+        key.limit_reset = reset;
+    }
+    if let Some(expires_at) = changes.expires_at {
+        key.expires_at = expires_at;
+    }
+    key.updated_at = now;
+    tx.execute(
+        "UPDATE api_keys SET name = ?, disabled = ?, spend_limit = ?, limit_reset = ?, expires_at = ?, updated_at = ? WHERE id = ?",
+        params![key.name, key.disabled, key.limit.map(Money::nanos), key.limit_reset.map(LimitReset::as_str), key.expires_at, now, key.id],
+    )?;
+    tx.commit()?;
+    Ok(Ok(key))
+}
+
+/// Revoke a key for good. Revoking one already revoked changes nothing.
+pub fn revoke_api_key(conn: &Connection, pubkey: &str, id: &str, now: i64) -> Result<Option<ApiKey>> {
+    conn.execute("UPDATE api_keys SET revoked_at = ?1, updated_at = ?1 WHERE id = ?2 AND pubkey = ?3 AND revoked_at IS NULL", params![now, id, pubkey])?;
+    get_api_key(conn, pubkey, id)
+}
+
+/// What a key has spent since `since`.
+pub fn api_key_spent(conn: &Connection, id: &str, since: i64) -> Result<Money> {
+    let nanos: i64 =
+        conn.query_row("SELECT COALESCE(SUM(cost), 0) FROM generations WHERE api_key_id = ? AND created_at >= ?", params![id, since], |r| r.get(0))?;
+    Ok(Money(nanos))
+}
+
+pub fn api_key_usage(conn: &Connection, id: &str, now: i64) -> Result<ApiKeyUsage> {
+    let since = [LimitReset::Daily, LimitReset::Weekly, LimitReset::Monthly].map(|r| r.period_start(now));
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(cost), 0),
+                COALESCE(SUM(CASE WHEN created_at >= ?2 THEN cost END), 0),
+                COALESCE(SUM(CASE WHEN created_at >= ?3 THEN cost END), 0),
+                COALESCE(SUM(CASE WHEN created_at >= ?4 THEN cost END), 0)
+         FROM generations WHERE api_key_id = ?1",
+        params![id, since[0], since[1], since[2]],
+        |r| Ok(ApiKeyUsage { total: Money(r.get(0)?), daily: Money(r.get(1)?), weekly: Money(r.get(2)?), monthly: Money(r.get(3)?) }),
+    )?)
 }
 
 /// Where a page after row `id` starts: its `(created_at, id)`. Sorting by
@@ -607,6 +883,7 @@ mod tests {
                         completion_tokens: 1,
                         cost: Money(1),
                         estimated: false,
+                        api_key_id: None,
                     },
                 )?;
             }

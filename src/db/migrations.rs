@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -136,4 +136,38 @@ CREATE TABLE bitcoin_addresses (
     sats INTEGER NOT NULL CHECK (sats > 0),
     UNIQUE (xpub, idx)
 ) STRICT;
+"#;
+
+/// API keys: bearer tokens for inference, made and managed with NIP-98, that
+/// spend their owner's credit.
+const API_KEYS: &str = r#"
+CREATE TABLE api_keys (
+    id TEXT PRIMARY KEY,
+    -- Whose credit it spends.
+    pubkey TEXT NOT NULL,
+    -- The sha256 of the key, in hex. The key itself is shown once, when it's
+    -- made, and never stored.
+    hash TEXT NOT NULL UNIQUE,
+    -- Enough of the key to tell it apart: `sk-shakespeare-1a2b…9z8y`.
+    label TEXT NOT NULL,
+    name TEXT NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)),
+    -- The most it may spend, per `limit_reset` period or, without one, ever.
+    -- NULL for no limit.
+    spend_limit INTEGER CHECK (spend_limit >= 0),
+    limit_reset TEXT CHECK (limit_reset IN ('daily', 'weekly', 'monthly')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    -- Revoked keys stay, so their generations still name them, but never work
+    -- again.
+    revoked_at INTEGER
+) STRICT;
+
+CREATE INDEX api_keys_pubkey ON api_keys (pubkey, created_at DESC, id DESC);
+
+-- The key a generation was made with, if any. A key's spend is the sum of
+-- its generations' costs, which the index covers.
+ALTER TABLE generations ADD COLUMN api_key_id TEXT REFERENCES api_keys (id);
+CREATE INDEX generations_api_key ON generations (api_key_id, created_at, cost) WHERE api_key_id IS NOT NULL;
 "#;

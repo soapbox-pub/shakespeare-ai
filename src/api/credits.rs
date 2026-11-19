@@ -164,6 +164,7 @@ pub async fn list_generations(
                     "total_tokens": g.prompt_tokens + g.completion_tokens,
                 },
                 "cost": g.cost.to_f64(),
+                "api_key_id": g.api_key_id,
             })
         })
         .collect();

@@ -19,7 +19,7 @@ use crate::money::{decimal_from_json_number, Money};
 use crate::store::{self, Generation};
 
 pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    let pubkey = app.authenticate(&method, &uri, &headers, &body)?;
+    let caller = app.authenticate_inference(&method, &uri, &headers, &body).await?;
     let mut request = super::json_object(&body)?;
 
     let valid = request.get("model").is_some_and(Value::is_string)
@@ -44,7 +44,8 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     // Credit is checked before and charged after: a request's cost isn't
     // known until it's done, so a balance can end a little below zero.
     if !free {
-        let who = pubkey.clone();
+        app.check_key_limit(&caller, Money::ZERO).await?;
+        let who = caller.pubkey.clone();
         let balance = app.db.call(move |conn| store::balance(conn, &who)).await?;
         if !balance.is_positive() {
             return Err(ApiError::new(
@@ -74,7 +75,8 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
 
     let meter = Meter {
         app: app.clone(),
-        pubkey,
+        api_key_id: caller.api_key_id(),
+        pubkey: caller.pubkey,
         model_id,
         price: TokenPrice { input: price.input, output: price.output },
         free,
@@ -186,6 +188,7 @@ fn add_cache_breakpoints(request: &mut Map<String, Value>) {
 struct Meter {
     app: Arc<App>,
     pubkey: String,
+    api_key_id: Option<String>,
     model_id: String,
     price: TokenPrice,
     free: bool,
@@ -249,10 +252,12 @@ impl Meter {
             completion_tokens: charge.completion_tokens,
             cost: charge.cost,
             estimated: charge.estimated,
+            api_key_id: self.api_key_id.clone(),
         };
         self.app.metrics.usage(&self.model_id, charge.prompt_tokens, charge.completion_tokens, charge.cost);
         let fields = json!({
             "pubkey": self.pubkey,
+            "api_key": self.api_key_id,
             "model": self.model_id,
             "stream": stream,
             "cost": charge.cost.to_f64(),
