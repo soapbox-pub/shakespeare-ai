@@ -288,6 +288,11 @@ async fn validates_requests() {
     let (_, body) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "lightning" })))).await.unwrap()).await;
     assert_eq!(body["error"]["code"], "unsupported_method");
 
+    let unsigned = Request::builder().uri("/v1/credits/methods").body(Body::empty()).unwrap();
+    let (status, body) = json_of(router(app.clone()).oneshot(unsigned).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "object": "list", "data": [], "has_more": false, "minimum_amount": 5.0, "fee": 0.1 }));
+
     let (status, body) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits/payments?limit=101", None)).await.unwrap()).await;
     assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("invalid_limit")));
 
@@ -321,6 +326,11 @@ async fn sells_credits_for_onchain_bitcoin() {
     let t = temp_db();
     let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
     app.rates.set(rust_decimal::Decimal::from(100_000));
+
+    // No signature needed.
+    let unsigned = Request::builder().uri("/v1/credits/methods").body(Body::empty()).unwrap();
+    let (_, methods) = json_of(router(app.clone()).oneshot(unsigned).await.unwrap()).await;
+    assert_eq!(methods["data"], json!([{ "object": "payment_method", "id": "bitcoin", "confirmations": 2 }]));
 
     let add = || signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "bitcoin" })));
     let (status, first) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;

@@ -20,6 +20,26 @@ pub async fn balance(State(app): State<Arc<App>>, method: Method, uri: Uri, head
     Ok(Json(json!({ "object": "credits", "amount": amount.to_f64() })))
 }
 
+/// What a client can buy credits with, and on what terms. Public: it's the
+/// same for everyone, and a client may want it before anyone signs in.
+pub async fn methods(State(app): State<Arc<App>>) -> Json<Value> {
+    let payments = &app.config.payments;
+    let mut data = Vec::new();
+    if payments.stripe.is_some() {
+        data.push(json!({ "object": "payment_method", "id": "stripe", "requires_redirect_url": true }));
+    }
+    if payments.lightning.is_some() {
+        data.push(json!({ "object": "payment_method", "id": "lightning" }));
+    }
+    if let Some(bitcoin) = &payments.bitcoin {
+        data.push(json!({ "object": "payment_method", "id": "bitcoin", "confirmations": bitcoin.confirmations }));
+    }
+    let mut body = list_response(data, false, None);
+    body["minimum_amount"] = payments.minimum().to_f64().into();
+    body["fee"] = rust_decimal::prelude::ToPrimitive::to_f64(&payments.fee).unwrap_or_default().into();
+    Json(body)
+}
+
 pub async fn add(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
     let pubkey = app.authenticate(&method, &uri, &headers, &body)?;
     let request = super::json_object(&body)?;

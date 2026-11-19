@@ -63,6 +63,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/images/generations", post(api::images::generations))
         .route("/v1/credits", get(api::credits::balance))
         .route("/v1/credits/add", post(api::credits::add))
+        .route("/v1/credits/methods", get(api::credits::methods))
         .route("/v1/credits/payments", get(api::credits::list_payments))
         .route("/v1/credits/payments/{payment_id}", get(api::credits::get_payment))
         .route("/v1/credits/giftcards", post(api::giftcards::create).get(api::giftcards::list))
