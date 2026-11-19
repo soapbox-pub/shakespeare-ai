@@ -273,6 +273,17 @@ async fn sells_and_redeems_gift_cards() {
 
     let (_, body) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits", None)).await.unwrap()).await;
     assert_eq!(body, json!({ "object": "credits", "amount": 12.0 }));
+
+    // A cancelled card is refunded, and listed as cancelled.
+    let (_, body) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/giftcards", Some(json!({ "amount": 5 })))).await.unwrap()).await;
+    let id = body["data"][0]["id"].as_str().unwrap().to_string();
+    let response = router(app.clone()).oneshot(signed("DELETE", &format!("/v1/credits/giftcards/{id}"), None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, body) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits/giftcards", None)).await.unwrap()).await;
+    let mut statuses: Vec<&str> = body["data"].as_array().unwrap().iter().map(|c| c["status"].as_str().unwrap()).collect();
+    statuses.sort();
+    assert_eq!(statuses, ["cancelled", "redeemed"]);
+    assert_eq!(balance(&app), Money(12_000_000_000));
 }
 
 #[tokio::test]

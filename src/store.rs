@@ -265,7 +265,8 @@ pub struct Giftcard {
     pub amount: Money,
     pub redeemed: bool,
     pub created_at: i64,
-    #[serde(skip)]
+    /// `active`, `redeemed` or `cancelled`: `redeemed` alone can't tell an
+    /// unused card from a cancelled one.
     pub status: String,
 }
 
