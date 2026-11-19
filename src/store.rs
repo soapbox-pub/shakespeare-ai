@@ -71,6 +71,7 @@ pub fn balance(conn: &Connection, pubkey: &str) -> Result<Money> {
 pub enum Method {
     Stripe,
     Lightning,
+    Bitcoin,
 }
 
 impl Method {
@@ -78,6 +79,7 @@ impl Method {
         match self {
             Method::Stripe => "stripe",
             Method::Lightning => "lightning",
+            Method::Bitcoin => "bitcoin",
         }
     }
 
@@ -85,6 +87,7 @@ impl Method {
         match s {
             "stripe" => Some(Method::Stripe),
             "lightning" => Some(Method::Lightning),
+            "bitcoin" => Some(Method::Bitcoin),
             _ => None,
         }
     }
@@ -152,6 +155,7 @@ fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
         description: match method {
             Method::Stripe => "Credit purchase via Stripe".into(),
             Method::Lightning => "Credit purchase via Lightning".into(),
+            Method::Bitcoin => "Credit purchase via Bitcoin".into(),
         },
         url: row.get(6)?,
         provider_ref: row.get(7)?,
@@ -216,6 +220,33 @@ pub fn expire_payment(conn: &Connection, id: &str) -> Result<()> {
 pub fn pending_lightning(conn: &Connection) -> Result<Vec<Payment>> {
     let mut stmt = conn.prepare_cached(&format!("SELECT {PAYMENT_COLUMNS} FROM payments WHERE status = 'pending' AND method = 'lightning'"))?;
     let rows = stmt.query_map([], payment_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The next unused receive address index for an account key.
+pub fn next_bitcoin_index(conn: &Connection, xpub: &str) -> Result<u32> {
+    let next: i64 = conn.query_row("SELECT COALESCE(MAX(idx) + 1, 0) FROM bitcoin_addresses WHERE xpub = ?", [xpub], |r| r.get(0))?;
+    Ok(u32::try_from(next)?)
+}
+
+pub fn insert_bitcoin_address(conn: &Connection, payment_id: &str, xpub: &str, index: u32, address: &str, sats: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO bitcoin_addresses (payment_id, xpub, idx, address, sats) VALUES (?, ?, ?, ?, ?)",
+        params![payment_id, xpub, index, address, i64::try_from(sats)?],
+    )?;
+    Ok(())
+}
+
+/// Bitcoin payments to look in on, with the sats each is owed: those
+/// pending, and those that expired within `grace` seconds, in case they're
+/// paid late.
+pub fn bitcoin_to_watch(conn: &Connection, now: i64, grace: i64) -> Result<Vec<(Payment, u64)>> {
+    let columns = PAYMENT_COLUMNS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ");
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {columns}, b.sats FROM payments p JOIN bitcoin_addresses b ON b.payment_id = p.id
+         WHERE p.method = 'bitcoin' AND (p.status = 'pending' OR (p.status = 'expired' AND p.expires_at > ?))"
+    ))?;
+    let rows = stmt.query_map([now - grace], |r| Ok((payment_row(r)?, r.get::<_, i64>(11)? as u64)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -482,6 +513,42 @@ mod tests {
             assert!(!complete_payment(conn, "pi_1", 6)?);
             assert_eq!(balance(conn, ALICE)?, DOLLAR.checked_mul(10).unwrap());
             assert_eq!(get_payment(conn, "pi_1")?.unwrap().status, "completed");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn watches_bitcoin_payments_until_their_grace_is_up() {
+        let t = temp_db();
+        t.db.with(|conn| {
+            for (i, (id, expires_at)) in [("pi_1", 100), ("pi_2", 100), ("pi_3", 10)].into_iter().enumerate() {
+                let address = format!("bc1q{i}");
+                let payment = NewPayment {
+                    id,
+                    pubkey: ALICE,
+                    method: Method::Bitcoin,
+                    amount: DOLLAR,
+                    fee: Money::ZERO,
+                    url: "bitcoin:x",
+                    provider_ref: Some(&address),
+                    created_at: 1,
+                    expires_at,
+                };
+                insert_payment(conn, &payment)?;
+                insert_bitcoin_address(conn, id, "xpub1", next_bitcoin_index(conn, "xpub1")?, &address, 1000)?;
+            }
+            assert_eq!(next_bitcoin_index(conn, "xpub1")?, 3);
+            assert_eq!(next_bitcoin_index(conn, "xpub2")?, 0);
+            // The same index can't be given out twice.
+            assert!(insert_bitcoin_address(conn, "pi_1", "xpub1", 0, "bc1qother", 1).is_err());
+
+            expire_payment(conn, "pi_2")?;
+            expire_payment(conn, "pi_3")?;
+            let ids = |now| -> Result<Vec<String>> { Ok(bitcoin_to_watch(conn, now, 50)?.into_iter().map(|(p, _)| p.id).collect()) };
+            assert_eq!(ids(100)?, ["pi_1", "pi_2"]);
+            assert_eq!(ids(200)?, ["pi_1"]);
+            assert_eq!(bitcoin_to_watch(conn, 0, 50)?[0].1, 1000);
             Ok(())
         })
         .unwrap();

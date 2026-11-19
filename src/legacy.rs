@@ -144,7 +144,7 @@ pub fn import(db: &Db, dir: &Path) -> Result<Report> {
             if !matches!(p.status.as_str(), "pending" | "completed" | "failed" | "expired") {
                 bail!("payment {} has unknown status {:?}", p.id, p.status);
             }
-            if store::Method::parse(&p.method).is_none() {
+            if !matches!(p.method.as_str(), "stripe" | "lightning") {
                 bail!("payment {} has unknown method {:?}", p.id, p.method);
             }
             // Only a LUD-21 verify URL is worth keeping; Stripe sessions

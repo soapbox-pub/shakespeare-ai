@@ -34,6 +34,14 @@ impl Rates {
     }
 }
 
+#[cfg(test)]
+impl Rates {
+    /// Fix the rate, so tests never ask the internet.
+    pub fn set(&self, rate: Decimal) {
+        *self.btc_usd.lock() = Some((rate, Instant::now()));
+    }
+}
+
 async fn fetch(http: &reqwest::Client) -> Result<Decimal> {
     let coinbase = async {
         let json: serde_json::Value =

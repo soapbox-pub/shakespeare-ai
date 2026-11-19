@@ -308,3 +308,66 @@ async fn validates_requests() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(response.headers()["access-control-allow-headers"], "authorization,content-type");
 }
+
+#[tokio::test]
+async fn sells_credits_for_onchain_bitcoin() {
+    use crate::payments::bitcoin::tests::{FakeEsplora, FIRST, SECOND, ZPUB};
+    let esplora = FakeEsplora::default();
+    *esplora.tip.lock() = 800_000;
+    let base = esplora.serve().await;
+    let yaml = format!(
+        "origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  bitcoin:\n    xpub: {ZPUB}\n    esplora: {base}\n    confirmations: 2\nproviders: {{}}\nmodels: {{}}\n"
+    );
+    let t = temp_db();
+    let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
+    app.rates.set(rust_decimal::Decimal::from(100_000));
+
+    let add = || signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "bitcoin" })));
+    let (status, first) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["method"], "bitcoin");
+    assert_eq!(first["status"], "pending");
+    assert_eq!(first["total"], 11.0);
+    // $11 at $100,000/BTC.
+    assert_eq!(first["url"], format!("bitcoin:{FIRST}?amount=0.00011&label=Shakespeare%20AI%20Credits"));
+    let (_, second) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert!(second["url"].as_str().unwrap().starts_with(&format!("bitcoin:{SECOND}?")));
+
+    let (status, body) = json_of(
+        router(app.clone())
+            .oneshot(signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "bitcoin", "redirect_url": "https://x.example" }))))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("invalid_parameter_combination")));
+
+    let status_of = |id: &str| app.db.with(|conn| Ok(store::get_payment(conn, id)?.unwrap().status)).unwrap();
+    let first_id = first["id"].as_str().unwrap();
+    let second_id = second["id"].as_str().unwrap();
+
+    // In the mempool, then one block deep: not yet.
+    esplora.pay(FIRST, 11_000, None);
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(first_id), "pending");
+    esplora.txs.lock().clear();
+    esplora.pay(FIRST, 11_000, Some(800_000));
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(first_id), "pending");
+    // Two deep: credited, once.
+    *esplora.tip.lock() = 800_001;
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(first_id), "completed");
+    assert_eq!(balance(&app), Money(10_000_000_000));
+
+    // Short by a sat: never credited.
+    esplora.pay(SECOND, 10_999, Some(800_000));
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(second_id), "pending");
+    assert_eq!(balance(&app), Money(10_000_000_000));
+
+    let (_, list) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits/payments?method=bitcoin", None)).await.unwrap()).await;
+    assert_eq!(list["data"].as_array().unwrap().len(), 2);
+    assert_eq!(list["data"][0]["description"], "Credit purchase via Bitcoin");
+}

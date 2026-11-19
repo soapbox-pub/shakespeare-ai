@@ -197,3 +197,28 @@ pub mod testing {
         TempDb { db, _dir: dir }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_payments_through_the_bitcoin_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_connection(&dir.path().join("t.sqlite3")).unwrap();
+        apply_migrations(&mut conn, &migrations::MIGRATIONS[..1]).unwrap();
+        conn.execute(
+            "INSERT INTO payments (id, pubkey, method, status, amount, fee, url, provider_ref, created_at, completed_at, expires_at)
+             VALUES ('pi_1', 'a', 'lightning', 'completed', 10, 1, 'lnbc1', 'https://v', 1, 2, 3)",
+            [],
+        )
+        .unwrap();
+        apply_migrations(&mut conn, migrations::MIGRATIONS).unwrap();
+        let row: (String, i64, Option<String>, Option<i64>) =
+            conn.query_row("SELECT method, fee, provider_ref, completed_at FROM payments WHERE id = 'pi_1'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!(row, ("lightning".into(), 1, Some("https://v".into()), Some(2)));
+        let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'payments' AND name LIKE 'payments_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexes, 2);
+        conn.execute("INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES ('pi_2', 'a', 'bitcoin', 'pending', 1, 0, 'bitcoin:x', 1, 2)", []).unwrap();
+    }
+}

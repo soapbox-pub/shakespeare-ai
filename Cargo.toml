@@ -9,6 +9,7 @@ description = "An OpenAI-compatible AI provider with Nostr (NIP-98) auth and pre
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
 base64 = "0.22"
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

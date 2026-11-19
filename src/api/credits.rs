@@ -46,6 +46,7 @@ pub async fn add(State(app): State<Arc<App>>, method: Method, uri: Uri, headers:
     let configured = match payment_method {
         PaymentMethod::Stripe => app.config.payments.stripe.is_some(),
         PaymentMethod::Lightning => app.config.payments.lightning.is_some(),
+        PaymentMethod::Bitcoin => app.config.payments.bitcoin.is_some(),
     };
     if !configured {
         return Err(unsupported());
@@ -57,7 +58,7 @@ pub async fn add(State(app): State<Arc<App>>, method: Method, uri: Uri, headers:
         Some(_) => return Err(ApiError::invalid("invalid_url", "Invalid URL").param("redirect_url")),
     };
     match (payment_method, &redirect_url) {
-        (PaymentMethod::Lightning, Some(_)) => {
+        (PaymentMethod::Lightning | PaymentMethod::Bitcoin, Some(_)) => {
             return Err(ApiError::invalid("invalid_parameter_combination", "redirect_url can only be used with stripe payment method").param("redirect_url"));
         }
         (PaymentMethod::Stripe, None) => {

@@ -413,7 +413,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
 
       <p>
         Initiates a payment to add credits to the user's account. Supports
-        Stripe and Lightning Network payments.
+        Stripe, Lightning Network and onchain Bitcoin payments.
       </p>
 
       <h4>Request Body (Stripe)</h4>
@@ -428,6 +428,19 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
   "amount": 10.00,
   "method": "lightning"
 }</div>
+
+      <h4>Request Body (Bitcoin)</h4>
+      <div class="code-block">{
+  "amount": 10.00,
+  "method": "bitcoin"
+}</div>
+
+      <p>
+        A Lightning payment's <code>url</code> is a bolt11 invoice. A Bitcoin
+        payment's is a BIP21 URI with a fresh address and the amount, such as
+        <code>bitcoin:bc1q...?amount=0.00011</code>; it completes once the
+        transaction confirms.
+      </p>
 
       <h4>Response</h4>
       <div class="code-block">{
@@ -451,8 +464,9 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
       </div>
 
       <p>
-        Checks the status of a payment. Payments are automatically completed via
-        webhooks when successful.
+        Checks the status of a payment. Payments are completed automatically
+        once paid: by Stripe's webhook, or by checking the Lightning invoice or
+        the Bitcoin address.
       </p>
 
       <h3>List Payments</h3>
@@ -493,7 +507,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
           <tr>
             <td><code>method</code></td>
             <td>string</td>
-            <td>Filter by method: stripe, lightning</td>
+            <td>Filter by method: stripe, lightning, bitcoin</td>
           </tr>
         </tbody>
       </table>

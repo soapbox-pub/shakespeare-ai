@@ -1,8 +1,8 @@
 # Shakespeare AI
 
 An OpenAI-compatible AI provider that authenticates with Nostr (NIP-98)
-instead of API keys, and bills prepaid credits bought by card (Stripe) or
-Lightning. It serves `https://ai.shakespeare.diy/v1`.
+instead of API keys, and bills prepaid credits bought by card (Stripe),
+Lightning or onchain bitcoin. It serves `https://ai.shakespeare.diy/v1`.
 
 This is the Rust rewrite of the Deno service (`soapbox-pub/shakespeare-ai`).
 Its API is the same, so clients don't change; see "Differences" below for what
@@ -49,7 +49,7 @@ YAML; see `config.example.yaml`, which documents every field. In short:
   `price` is per image, by quality and shape. `hidden: true` keeps a model out
   of `/v1/models` while it stays callable. Free chat models are always hidden.
 - **payments**: the fee (`0.1` is 10%), the minimum purchase, Stripe's keys,
-  and the Lightning address.
+  the Lightning address, and the bitcoin account key.
 
 Any secret may be `${ENV_VAR}`. Unknown fields are errors, so typos don't pass
 silently.
@@ -63,6 +63,33 @@ is involved. **The address's server must support LUD-21**; if it doesn't
 return a `verify` URL, the payment is refused before it's shown. LNbits'
 lnurlp extension doesn't support it. Alby, Coinos and Primal do, among others.
 
+## Onchain bitcoin
+
+Each payment gets a fresh address, derived from a watch-only BIP84 account key
+(`zpub`, or `xpub` for the same account) on its receive chain, `…/0/i`. The
+service holds no private key; the money lands in the wallet the key came
+from. Addresses are native segwit (`bc1q…`), and the payment's `url` is a
+BIP21 `bitcoin:` URI with the amount, for a QR code.
+
+Payments are confirmed by polling an Esplora API (mempool.space's unless
+`esplora` says otherwise; run your own for privacy) once a minute, and
+credited once the sats asked for are `confirmations` blocks deep (1 by
+default; 0 trusts the mempool, where a payment can still be double-spent).
+
+- The amount in sats is fixed when the payment is made, at that moment's rate.
+- A payment stays payable for a day. One that's been sent something stays
+  pending while it confirms, and an address is watched for a week after its
+  payment expires, so late payments still count.
+- **Paying too little credits nothing**, and paying too much credits only
+  what was bought. Both are logged (`payments.bitcoin.underpaid`,
+  `payments.bitcoin.overpaid`), for an operator to settle by hand.
+- Unpaid payments leave unused addresses, so the wallet must look further
+  ahead than the usual gap limit of 20 to see everything. Raise it (Sparrow:
+  Settings → Gap limit), or the wallet won't show some payments.
+- Indexes are counted per account key, so changing the key starts again at 0.
+- Don't use the key for anything else that hands out receive addresses, or
+  the two will reuse each other's.
+
 ## Storage
 
 SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
@@ -73,7 +100,8 @@ SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
 - `accounts` caches each balance, updated in the same transaction as each
   ledger entry.
 - `payments`, `giftcards` and `generations` are the records behind the
-  entries.
+  entries. `bitcoin_addresses` holds each bitcoin payment's address, its
+  derivation index and the sats it's owed.
 
 Anything that releases money (a payment completing, a gift card being
 redeemed or cancelled) is one conditional `UPDATE … RETURNING`, and credit

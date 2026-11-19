@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
 
 use crate::money::{deserialize_decimal, Money};
+use crate::payments::bitcoin::Wallet;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,11 +49,13 @@ pub struct Payments {
     pub stripe: Option<Stripe>,
     #[serde(default)]
     pub lightning: Option<Lightning>,
+    #[serde(default)]
+    pub bitcoin: Option<Bitcoin>,
 }
 
 impl Default for Payments {
     fn default() -> Self {
-        Payments { fee: default_fee(), minimum: default_minimum(), stripe: None, lightning: None }
+        Payments { fee: default_fee(), minimum: default_minimum(), stripe: None, lightning: None, bitcoin: None }
     }
 }
 
@@ -85,6 +88,39 @@ pub struct Lightning {
     /// A Lightning address (LUD-16) whose LNURL-pay server returns a LUD-21
     /// `verify` URL with each invoice, which is how payment is confirmed.
     pub address: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bitcoin {
+    /// A native segwit (BIP84) account's extended public key, `zpub` or
+    /// `xpub` (`vpub` or `tpub` on testnet). Each payment gets the next
+    /// receive address.
+    #[serde(deserialize_with = "wallet")]
+    pub xpub: Wallet,
+    /// An Esplora API root. mempool.space's, for a mainnet key, unless given;
+    /// a testnet key must say which testnet.
+    #[serde(default)]
+    esplora: Option<url::Url>,
+    /// How deep a payment's transaction must be before it's credited. Zero
+    /// credits it from the mempool, where it can still be double-spent.
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u32,
+}
+
+fn default_confirmations() -> u32 {
+    1
+}
+
+impl Bitcoin {
+    pub fn esplora(&self) -> url::Url {
+        self.esplora.clone().unwrap_or_else(|| url::Url::parse("https://mempool.space/api").expect("a URL"))
+    }
+}
+
+fn wallet<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Wallet, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    Wallet::parse(&raw).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +267,12 @@ impl Config {
         {
             bail!("payments.lightning.address must look like name@domain");
         }
+        if let Some(bitcoin) = &self.payments.bitcoin
+            && bitcoin.esplora.is_none()
+            && bitcoin.xpub.network() != ::bitcoin::Network::Bitcoin
+        {
+            bail!("payments.bitcoin.esplora must be set for a testnet key, such as https://mempool.space/testnet4/api");
+        }
         for (id, model) in &self.models {
             let (provider, upstream) = model.upstream();
             if upstream.is_empty() {
@@ -289,6 +331,7 @@ mod tests {
         let gemma = &config.models["gemma-4-26b"];
         assert_eq!(gemma.upstream(), ("openrouter", "google/gemma-4-26b-a4b-it"));
         assert!(gemma.is_free_chat());
+        assert_eq!(config.payments.bitcoin.unwrap().xpub.address(0).unwrap(), crate::payments::bitcoin::tests::FIRST);
     }
 
     #[test]
@@ -299,6 +342,18 @@ mod tests {
         assert!(err("  m:\n    upstream: p\n    context_window: 1\n    price: {input: 1, output: 1}\n").contains("provider/model"));
         assert!(err("  m:\n    upstream: p/x\n    price: {input: 1, output: 1}\n").contains("context_window"));
         assert!(Config::parse(&format!("{base}models: {{}}\ntypo: 1\n")).is_err());
+
+        let bitcoin = |section: &str| Config::parse(&format!("{base}models: {{}}\npayments:\n  bitcoin:\n{section}"));
+        assert!(bitcoin("    xpub: nope\n").unwrap_err().to_string().contains("extended public key"));
+        let zpub = crate::payments::bitcoin::tests::ZPUB;
+        let config = bitcoin(&format!("    xpub: {zpub}\n")).unwrap();
+        let b = config.payments.bitcoin.unwrap();
+        assert_eq!((b.esplora().as_str(), b.confirmations), ("https://mempool.space/api", 1));
+        // A testnet key must say which testnet.
+        let mut tpub = ::bitcoin::base58::decode_check(zpub).unwrap();
+        tpub[..4].copy_from_slice(&[0x04, 0x35, 0x87, 0xcf]);
+        let tpub = ::bitcoin::base58::encode_check(&tpub);
+        assert!(bitcoin(&format!("    xpub: {tpub}\n")).unwrap_err().to_string().contains("esplora"));
     }
 
     #[test]
