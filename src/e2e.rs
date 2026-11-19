@@ -511,3 +511,14 @@ async fn validates_api_keys() {
     let (status, body) = call(with_key("POST", "/v1/chat/completions", created["key"].as_str().unwrap(), Some(chat))).await;
     assert_eq!((status, &body["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("api_key_expired")));
 }
+
+#[tokio::test]
+async fn leaves_unknown_api_paths_to_the_api() {
+    let (app, _t) = setup().await;
+    for (method, path) in [("GET", "/v1/nope"), ("GET", "/v1"), ("POST", "/credits"), ("GET", "/webhooks/nope")] {
+        let request = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        let (status, body) = json_of(router(app.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        assert_eq!(body["error"]["code"], "not_found");
+    }
+}

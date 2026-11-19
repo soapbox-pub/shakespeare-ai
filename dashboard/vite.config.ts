@@ -9,6 +9,13 @@ export default defineConfig(() => ({
   server: {
     host: "::",
     port: 8080,
+    // The API is the Rust server's; run it alongside, with an `origin` on
+    // localhost so NIP-98 events signed here are accepted.
+    proxy: {
+      "/v1": "http://127.0.0.1:8000",
+      "/docs": "http://127.0.0.1:8000",
+      "/terms": "http://127.0.0.1:8000",
+    },
   },
   plugins: [
     react(),

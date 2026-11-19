@@ -1,0 +1,111 @@
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMemo } from 'react';
+
+import { useCurrentUser } from '@/hooks/useCurrentUser';
+import { ApiClient, type List, type Model, type PaymentMethod, type PaymentMethods, publicRequest } from '@/lib/api';
+
+/**
+ * An API client signed in as the current account, or undefined when logged
+ * out. Recreated when the account changes, so switching accounts never signs
+ * with the last one's key.
+ */
+export function useApi(): ApiClient | undefined {
+  const { user } = useCurrentUser();
+  return useMemo(() => (user ? new ApiClient(user.signer) : undefined), [user]);
+}
+
+/** Query keys start with the account, so one account's data never shows for another. */
+function useAccountKey(): string | undefined {
+  return useCurrentUser().user?.pubkey;
+}
+
+export function useBalance() {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  return useQuery({
+    queryKey: ['balance', pubkey],
+    queryFn: () => api!.balance(),
+    enabled: !!api,
+    staleTime: 10_000,
+  });
+}
+
+export function usePaymentMethods() {
+  return useQuery({
+    queryKey: ['payment-methods'],
+    queryFn: () => publicRequest<PaymentMethods>('/v1/credits/methods'),
+  });
+}
+
+export function useModels() {
+  return useQuery({
+    queryKey: ['models'],
+    queryFn: async () => (await publicRequest<{ data: Model[] }>('/v1/models')).data,
+  });
+}
+
+/** A paged list, newest first, loading 50 more at a time. */
+function useList<T extends { id: string }>(name: string, fetch: (api: ApiClient, after?: string) => Promise<List<T>>) {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  return useInfiniteQuery({
+    queryKey: [name, pubkey],
+    queryFn: ({ pageParam }) => fetch(api!, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => (last.has_more ? last.data.at(-1)?.id : undefined),
+    enabled: !!api,
+    staleTime: 10_000,
+  });
+}
+
+export function usePayments() {
+  return useList('payments', (api, after) => api.payments(after));
+}
+
+export function useGenerations() {
+  return useList('generations', (api, after) => api.generations(after));
+}
+
+/** Watch a payment until it's settled, then refresh the balance and history. */
+export function usePayment(id: string | undefined, method: PaymentMethod | undefined) {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  const queryClient = useQueryClient();
+  return useQuery({
+    queryKey: ['payment', pubkey, id],
+    queryFn: async () => {
+      const payment = await api!.payment(id!);
+      if (payment.status !== 'pending') {
+        void queryClient.invalidateQueries({ queryKey: ['balance', pubkey] });
+        void queryClient.invalidateQueries({ queryKey: ['payments', pubkey] });
+      }
+      return payment;
+    },
+    enabled: !!api && !!id,
+    // Asking about a Lightning payment checks the invoice there and then, so
+    // it's worth asking often. Bitcoin is checked by the server once a
+    // minute, and Stripe by its webhook.
+    refetchInterval: (query) => (query.state.data?.status !== 'pending' ? false : method === 'lightning' ? 3_000 : 15_000),
+    staleTime: 0,
+  });
+}
+
+export function useAddCredits() {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { amount: number; method: PaymentMethod; redirect_url?: string }) => api!.addCredits(input),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['payments', pubkey] }),
+  });
+}
+
+export function useRedeemGiftcard() {
+  const api = useApi();
+  const pubkey = useAccountKey();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (code: string) => api!.redeemGiftcard(code),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['balance', pubkey] }),
+  });
+}

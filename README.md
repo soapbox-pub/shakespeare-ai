@@ -35,6 +35,24 @@ Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
   links.
 - `import-legacy DIR`: import the old service's database (see below).
 
+## Dashboard
+
+The site at `/` is a dashboard (`dashboard/`, React and Vite, started from
+mkstack): the models and their prices for anyone, and for someone logged in
+with Nostr, their balance, buying credits, redeeming gift cards, payments and
+usage. It has no API of its own. It signs each request to the public API with
+NIP-98, as any client does, so there are no sessions or cookies.
+
+Any path that isn't the API's (`/v1/…`, `/webhooks/…`, `/docs`, `/terms`,
+`/metrics`) is the dashboard's, falling back to its `index.html`.
+`GET /v1/credits/methods` tells it the payment methods configured, the minimum
+and the fee.
+
+`nix build` compiles the dashboard into the binary (the `embedded-dashboard`
+feature). Otherwise it's served from `dashboard/dist`, under the working
+directory, beside the binary or in the source tree, so build it first:
+`cd dashboard && npm ci && npm run build`.
+
 ## Configuration
 
 YAML; see `config.example.yaml`, which documents every field. In short:
@@ -191,10 +209,20 @@ of their own, since their effects are already in the opening balances.
 ## Development
 
 ```sh
-nix develop        # or have cargo, rustc and a C compiler
+nix develop        # or have cargo, rustc, node and a C compiler
 cargo clippy --all-targets
 cargo test
+(cd dashboard && npm ci && npm test)
 ```
+
+For the dashboard with hot reload, run the server with `listen:
+127.0.0.1:8000` and `origin: http://localhost:8000`, and `npm run dev` in
+`dashboard/`, which proxies the API to it. NIP-98 events are signed for the
+page's URL, and only their host is checked against `origin`, so open the
+dashboard at `localhost:8080`.
+
+Changing the dashboard's dependencies means refreshing `npmDepsHash` in
+`flake.nix`: `prefetch-npm-deps dashboard/package-lock.json`.
 
 ## License
 

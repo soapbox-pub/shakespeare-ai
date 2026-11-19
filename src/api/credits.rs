@@ -165,6 +165,7 @@ pub async fn list_generations(
                 },
                 "cost": g.cost.to_f64(),
                 "api_key_id": g.api_key_id,
+                "estimated": g.estimated,
             })
         })
         .collect();

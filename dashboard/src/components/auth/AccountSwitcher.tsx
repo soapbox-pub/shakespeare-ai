@@ -1,6 +1,4 @@
 import { ChevronDown, LogOut, UserIcon, UserPlus } from 'lucide-react';
-import { Link } from 'react-router-dom';
-import { nip19 } from 'nostr-tools';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -50,30 +48,28 @@ export function AccountSwitcher({ onAddAccountClick }: AccountSwitcherProps) {
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent className='w-56 p-2 animate-scale-in'>
-        <DropdownMenuItem asChild className='flex items-center gap-2 cursor-pointer p-2 rounded-md'>
-          <Link to={`/${nip19.npubEncode(currentUser.pubkey)}`}>
-            <Avatar className='w-8 h-8'>
-              <AvatarImage
-                src={currentUser.metadata.picture}
-                alt={isCurrentUserPending ? '' : getDisplayName(currentUser)}
-              />
-              <AvatarFallback>
-                {isCurrentUserPending ? (
-                  <Skeleton className='size-full rounded-full' />
-                ) : (
-                  getDisplayName(currentUser)?.charAt(0) || <UserIcon />
-                )}
-              </AvatarFallback>
-            </Avatar>
-            <div className='flex-1 truncate'>
+        <div className='flex items-center gap-2 p-2'>
+          <Avatar className='w-8 h-8'>
+            <AvatarImage
+              src={currentUser.metadata.picture}
+              alt={isCurrentUserPending ? '' : getDisplayName(currentUser)}
+            />
+            <AvatarFallback>
               {isCurrentUserPending ? (
-                <Skeleton className='h-4 w-24' />
+                <Skeleton className='size-full rounded-full' />
               ) : (
-                <p className='text-sm font-medium'>{getDisplayName(currentUser)}</p>
+                getDisplayName(currentUser)?.charAt(0) || <UserIcon />
               )}
-            </div>
-          </Link>
-        </DropdownMenuItem>
+            </AvatarFallback>
+          </Avatar>
+          <div className='flex-1 truncate'>
+            {isCurrentUserPending ? (
+              <Skeleton className='h-4 w-24' />
+            ) : (
+              <p className='text-sm font-medium'>{getDisplayName(currentUser)}</p>
+            )}
+          </div>
+        </div>
         {otherUsers.map((user) => {
           const isPending = isLoading && !user.metadata.name;
           return (

@@ -27,6 +27,7 @@ pub struct App {
     pub rates: Rates,
     pub metrics: Metrics,
     pub limiter: RateLimiter,
+    pub dashboard: crate::dashboard::Source,
 }
 
 impl App {
@@ -38,7 +39,7 @@ impl App {
             // minutes, but an upstream silent this long is gone.
             .read_timeout(Duration::from_secs(600))
             .build()?;
-        Ok(App { config, db, http, rates: Rates::default(), metrics: Metrics::default(), limiter: RateLimiter::default() })
+        Ok(App { config, db, http, rates: Rates::default(), metrics: Metrics::default(), limiter: RateLimiter::default(), dashboard: crate::dashboard::source() })
     }
 
     /// The pubkey a request's NIP-98 header was signed by. Only NIP-98 will
@@ -125,7 +126,6 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("../assets/index.html")) }))
         .route("/docs", get(|| async { Html(include_str!("../assets/docs.html")) }))
         .route("/terms", get(|| async { Html(include_str!("../assets/terms.html")) }))
         .route("/metrics", get(metrics))
@@ -145,11 +145,23 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/keys", post(api::keys::create).get(api::keys::list))
         .route("/v1/keys/{key_id}", get(api::keys::get).patch(api::keys::update).delete(api::keys::revoke))
         .route("/webhooks/stripe", post(api::credits::stripe_webhook))
-        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "invalid_request_error", "not_found", "Not found") })
+        .fallback(fallback)
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(app.clone(), observe))
         .layer(middleware::from_fn(cors))
         .with_state(app)
+}
+
+/// The API's own paths are JSON errors; anything else is the dashboard's, a
+/// file or one of its routes.
+async fn fallback(State(app): State<Arc<App>>, method: Method, uri: axum::http::Uri, headers: HeaderMap) -> Response {
+    let path = uri.path();
+    let api = path == "/v1" || path.starts_with("/v1/") || path.starts_with("/webhooks/");
+    if api || !matches!(method, Method::GET | Method::HEAD) {
+        return ApiError::new(StatusCode::NOT_FOUND, "invalid_request_error", "not_found", "Not found").into_response();
+    }
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || app.dashboard.serve(&path, &headers)).await.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn metrics(State(app): State<Arc<App>>) -> impl IntoResponse {

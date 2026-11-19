@@ -17,6 +17,7 @@ hex = "0.4"
 hmac = "0.12"
 indexmap = { version = "2", features = ["serde"] }
 parking_lot = "0.12"
+percent-encoding = "2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -29,6 +30,11 @@ sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 url = { version = "2", features = ["serde"] }
+
+[features]
+# Compile dashboard/dist into the binary (see build.rs). Without it the
+# dashboard is read from disk, so it can be rebuilt while the server runs.
+embedded-dashboard = []
 
 [dev-dependencies]
 tempfile = "3"

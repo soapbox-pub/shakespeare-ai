@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod config;
+mod dashboard;
 mod db;
 #[cfg(test)]
 mod e2e;
