@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use parking_lot::Mutex;
@@ -126,8 +126,6 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route("/docs", get(|| async { Html(include_str!("../assets/docs.html")) }))
-        .route("/terms", get(|| async { Html(include_str!("../assets/terms.html")) }))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(api::models::list))
         .route("/v1/chat/completions", post(api::chat::completions))

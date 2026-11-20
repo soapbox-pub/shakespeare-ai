@@ -45,12 +45,7 @@ export function Layout() {
 
           <div className="mx-2.5 my-2 h-px bg-sidebar-border" />
 
-          <SidebarTip label="API docs">
-            <a href="/docs" className={item}>
-              <BookOpen className="size-4.5 shrink-0 opacity-70 group-hover:opacity-100" aria-hidden />
-              <span className="max-md:sr-only">API docs</span>
-            </a>
-          </SidebarTip>
+          <NavItem to="/docs" label="API docs" icon={BookOpen} />
         </nav>
 
         <div className="mt-auto flex flex-col gap-2">
@@ -58,7 +53,7 @@ export function Layout() {
           <ThemeSwitch />
           <LoginArea variant="sidebar" />
           <div className="hidden flex-wrap gap-x-3 gap-y-1 px-2 pt-1 text-xs text-sidebar-foreground/55 md:flex">
-            <a href="/terms" className="hover:text-sidebar-foreground">Terms</a>
+            <Link to="/terms" className="hover:text-sidebar-foreground">Terms</Link>
             <a href="https://shakespeare.diy" className="hover:text-sidebar-foreground">shakespeare.diy</a>
             <span>Open source, AGPLv3</span>
           </div>

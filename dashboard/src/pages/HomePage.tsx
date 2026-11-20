@@ -59,9 +59,9 @@ export default function HomePage() {
             <LoginArea />
           )}
           <Button asChild variant="outline" size="lg" className="rounded-full px-6">
-            <a href="/docs">
+            <Link to="/docs">
               <BookOpen /> Read the docs
-            </a>
+            </Link>
           </Button>
         </div>
       </section>
