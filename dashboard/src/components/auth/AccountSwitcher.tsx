@@ -1,4 +1,5 @@
-import { ChevronDown, LogOut, UserIcon, UserPlus } from 'lucide-react';
+import { ChevronDown, ChevronsUpDown, LogOut, UserIcon, UserPlus } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -12,9 +13,12 @@ import { useLoggedInAccounts, type Account } from '@/hooks/useLoggedInAccounts';
 
 interface AccountSwitcherProps {
   onAddAccountClick: () => void;
+  /** `sidebar` shows the name beside the avatar, across the sidebar's width. */
+  variant?: 'default' | 'sidebar';
 }
 
-export function AccountSwitcher({ onAddAccountClick }: AccountSwitcherProps) {
+export function AccountSwitcher({ onAddAccountClick, variant = 'default' }: AccountSwitcherProps) {
+  const sidebar = variant === 'sidebar';
   const { currentUser, otherUsers, isLoading, setLogin, removeLogin } = useLoggedInAccounts();
 
   if (!currentUser) return null;
@@ -30,8 +34,16 @@ export function AccountSwitcher({ onAddAccountClick }: AccountSwitcherProps) {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <button className='flex items-center gap-2 h-10 p-1 pr-2.5 rounded-full hover:bg-accent transition-all text-foreground'>
-          <Avatar className='w-8 h-8'>
+        <button
+          className={cn(
+            'flex items-center gap-2 transition-all text-foreground',
+            sidebar
+              ? 'w-full h-11 rounded-lg p-1.5 hover:bg-sidebar-accent/60 data-[state=open]:bg-sidebar-accent/60 max-md:justify-center'
+              : 'h-10 p-1 pr-2.5 rounded-full hover:bg-accent',
+          )}
+          aria-label='Account'
+        >
+          <Avatar className='w-8 h-8 ring-2 ring-background shadow-xs'>
             <AvatarImage
               src={currentUser.metadata.picture}
               alt={isCurrentUserPending ? '' : getDisplayName(currentUser)}
@@ -44,10 +56,19 @@ export function AccountSwitcher({ onAddAccountClick }: AccountSwitcherProps) {
               )}
             </AvatarFallback>
           </Avatar>
-          <ChevronDown className='w-4 h-4 text-muted-foreground' />
+          {sidebar ? (
+            <>
+              <span className='hidden flex-1 truncate text-left text-sm font-medium md:block'>
+                {isCurrentUserPending ? <Skeleton className='h-4 w-24' /> : getDisplayName(currentUser)}
+              </span>
+              <ChevronsUpDown className='hidden w-4 h-4 text-muted-foreground md:block' />
+            </>
+          ) : (
+            <ChevronDown className='w-4 h-4 text-muted-foreground' />
+          )}
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent className='w-56 p-2 animate-scale-in'>
+      <DropdownMenuContent className='w-56 p-2 animate-scale-in' side={sidebar ? 'top' : 'bottom'} align={sidebar ? 'start' : 'center'}>
         <div className='flex items-center gap-2 p-2'>
           <Avatar className='w-8 h-8'>
             <AvatarImage

@@ -1,5 +1,8 @@
 import { useSeoMeta } from '@unhead/react';
+import { BarChart3 } from 'lucide-react';
 
+import { EmptyState } from '@/components/EmptyState';
+import { PageHeader } from '@/components/PageHeader';
 import { RequireLogin } from '@/components/RequireLogin';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -26,18 +29,15 @@ function Usage() {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-1">
-        <h1 className="text-3xl font-semibold tracking-tight">Usage</h1>
-        <p className="text-muted-foreground">Every request, newest first, and what it cost.</p>
-      </div>
+      <PageHeader title="Usage" description="Every request, newest first, and what it cost." />
       {generations.isPending ? (
         <Skeleton className="h-64 rounded-xl" />
       ) : generations.isError ? (
         <p className="text-sm text-destructive">{generations.error.message}</p>
       ) : rows.length === 0 ? (
-        <p className="text-muted-foreground">No requests yet. Point any OpenAI-compatible client at this server to get started.</p>
+        <EmptyState icon={BarChart3}>No requests yet. Point any OpenAI-compatible client at this server to get started.</EmptyState>
       ) : (
-        <div className="rounded-xl border">
+        <div className="overflow-hidden rounded-xl border bg-card shadow-xs">
           <Table>
             <TableHeader>
               <TableRow>
@@ -54,7 +54,7 @@ function Usage() {
                 <TableRow key={generation.id}>
                   <TableCell className="whitespace-nowrap">{dateTime(generation.created)}</TableCell>
                   <TableCell>
-                    <code className="text-xs">{generation.model}</code>
+                    <code className="rounded-md bg-muted px-1.5 py-0.5 text-xs">{generation.model}</code>
                   </TableCell>
                   <TableCell className="hidden text-muted-foreground md:table-cell">
                     {generation.api_key_id ? (keyNames.get(generation.api_key_id) ?? 'An API key') : 'Nostr'}

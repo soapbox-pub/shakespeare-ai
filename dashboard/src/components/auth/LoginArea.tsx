@@ -1,3 +1,4 @@
+import { LogIn } from 'lucide-react';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button.tsx';
 import AuthDialog from './AuthDialog';
@@ -25,12 +26,15 @@ function getNip07Provider(): Nip07Provider | undefined {
 
 export interface LoginAreaProps {
   className?: string;
+  /** `sidebar` fills the sidebar's width, and shrinks to an icon on its narrow form. */
+  variant?: 'default' | 'sidebar';
 }
 
-export function LoginArea({ className }: LoginAreaProps) {
+export function LoginArea({ className, variant = 'default' }: LoginAreaProps) {
   const { currentUser } = useLoggedInAccounts();
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
   const [quickLoginPubkey, setQuickLoginPubkey] = useState<string | null>(null);
+  const sidebar = variant === 'sidebar';
 
   const handleJoin = async () => {
     const provider = getNip07Provider();
@@ -49,15 +53,19 @@ export function LoginArea({ className }: LoginAreaProps) {
   };
 
   return (
-    <div className={cn('inline-flex items-center justify-center', className)}>
+    <div className={cn('inline-flex items-center justify-center', sidebar && 'flex w-full', className)}>
       {currentUser ? (
-        <AccountSwitcher onAddAccountClick={() => setAuthDialogOpen(true)} />
+        <AccountSwitcher onAddAccountClick={() => setAuthDialogOpen(true)} variant={variant} />
       ) : (
         <Button
           onClick={handleJoin}
-          className="flex items-center gap-2 px-5 py-2 rounded-full bg-primary text-primary-foreground font-medium transition-all hover:bg-primary/90 animate-scale-in"
+          variant="brand"
+          size={sidebar ? 'default' : 'lg'}
+          className={cn('rounded-full px-6 animate-scale-in', sidebar && 'w-full rounded-lg max-md:size-10 max-md:px-0')}
+          aria-label="Log in"
         >
-          <span className="truncate">Log in</span>
+          {sidebar && <LogIn className="md:hidden" />}
+          <span className={cn('truncate', sidebar && 'max-md:hidden')}>Log in</span>
         </Button>
       )}
 

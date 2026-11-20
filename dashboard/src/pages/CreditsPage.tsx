@@ -1,15 +1,16 @@
 import { useSeoMeta } from '@unhead/react';
-import { Gift, Plus, ShoppingBag } from 'lucide-react';
+import { Gift, Plus, Receipt, ShoppingBag } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { AddCreditsDialog } from '@/components/AddCreditsDialog';
 import { BuyGiftcardsDialog } from '@/components/BuyGiftcardsDialog';
+import { EmptyState } from '@/components/EmptyState';
 import { GiftcardList } from '@/components/GiftcardList';
+import { PageHeader, SectionHeader } from '@/components/PageHeader';
 import { RedeemGiftcardDialog } from '@/components/RedeemGiftcardDialog';
 import { RequireLogin } from '@/components/RequireLogin';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { useBalance, usePayments } from '@/hooks/useCredits';
@@ -55,28 +56,34 @@ function Credits() {
 
   return (
     <div className="space-y-10">
-      <h1 className="text-3xl font-semibold tracking-tight">Credits</h1>
+      <PageHeader title="Credits" description="What your requests spend. Add more whenever you like; they don't expire." />
 
-      <Card>
-        <CardHeader>
-          <CardDescription>Balance</CardDescription>
-          <CardTitle className="text-4xl font-semibold tabular-nums">
-            {balance.isPending ? <Skeleton className="h-10 w-40" /> : balance.isError ? '—' : usd(balance.data.amount)}
-          </CardTitle>
+      <section className="flex flex-wrap items-end justify-between gap-6 rounded-3xl border bg-brand-soft p-6 sm:p-8">
+        <div className="space-y-1">
+          <div className="text-sm font-medium text-muted-foreground">Balance</div>
+          <div className="text-5xl font-bold tracking-tight tabular-nums">
+            {balance.isPending ? (
+              <Skeleton className="h-12 w-48" />
+            ) : balance.isError ? (
+              '—'
+            ) : (
+              <span className="text-brand">{usd(balance.data.amount)}</span>
+            )}
+          </div>
           {balance.isError && <p className="text-sm text-destructive">{balance.error.message}</p>}
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          <Button onClick={() => setAdding(true)}>
-            <Plus className="size-4" /> Add credits
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="brand" size="lg" className="rounded-full px-5" onClick={() => setAdding(true)}>
+            <Plus /> Add credits
           </Button>
-          <Button variant="outline" onClick={() => setRedeeming(true)}>
-            <Gift className="size-4" /> Redeem a gift card
+          <Button variant="outline" size="lg" className="rounded-full bg-background/70 px-5" onClick={() => setRedeeming(true)}>
+            <Gift /> Redeem
           </Button>
-          <Button variant="outline" onClick={() => setBuying(true)}>
-            <ShoppingBag className="size-4" /> Buy gift cards
+          <Button variant="outline" size="lg" className="rounded-full bg-background/70 px-5" onClick={() => setBuying(true)}>
+            <ShoppingBag /> Buy gift cards
           </Button>
-        </CardContent>
-      </Card>
+        </div>
+      </section>
 
       <PaymentHistory onResume={setResuming} />
 
@@ -104,15 +111,15 @@ function PaymentHistory({ onResume }: { onResume: (payment: Payment) => void }) 
 
   return (
     <section className="space-y-4">
-      <h2 className="text-xl font-semibold tracking-tight">Payments</h2>
+      <SectionHeader title="Payments" />
       {payments.isPending ? (
         <Skeleton className="h-32 rounded-xl" />
       ) : payments.isError ? (
         <p className="text-sm text-destructive">{payments.error.message}</p>
       ) : rows.length === 0 ? (
-        <p className="text-muted-foreground">No payments yet.</p>
+        <EmptyState icon={Receipt}>No payments yet. Credits you add show up here.</EmptyState>
       ) : (
-        <div className="rounded-xl border">
+        <div className="overflow-hidden rounded-xl border bg-card shadow-xs">
           <Table>
             <TableHeader>
               <TableRow>

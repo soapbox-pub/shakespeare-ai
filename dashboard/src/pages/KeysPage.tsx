@@ -1,8 +1,10 @@
 import { useSeoMeta } from '@unhead/react';
-import { MoreHorizontal, Plus } from 'lucide-react';
+import { KeyRound, MoreHorizontal, Plus } from 'lucide-react';
 import { useState } from 'react';
 
+import { EmptyState } from '@/components/EmptyState';
 import { KeyDialog } from '@/components/KeyDialog';
+import { PageHeader, SectionHeader } from '@/components/PageHeader';
 import { RequireLogin } from '@/components/RequireLogin';
 import {
   AlertDialog,
@@ -46,32 +48,28 @@ function Keys() {
 
   return (
     <div className="space-y-8">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div className="max-w-2xl space-y-1">
-          <h1 className="text-3xl font-semibold tracking-tight">API keys</h1>
-          <p className="text-muted-foreground">
-            For clients that can't sign each request with Nostr. A key spends your credits on chat and image requests
-            only, up to its limit, and can't touch your account in any other way.
-          </p>
-        </div>
-        <Button onClick={() => setCreating(true)}>
-          <Plus className="size-4" /> Create key
+      <PageHeader
+        title="API keys"
+        description="For clients that can't sign each request with Nostr. A key spends your credits on chat and image requests only, up to its limit, and can't touch your account in any other way."
+      >
+        <Button variant="brand" className="rounded-full px-5" onClick={() => setCreating(true)}>
+          <Plus /> Create key
         </Button>
-      </div>
+      </PageHeader>
 
       {keys.isPending ? (
         <Skeleton className="h-40 rounded-xl" />
       ) : keys.isError ? (
         <p className="text-sm text-destructive">{keys.error.message}</p>
       ) : live.length === 0 ? (
-        <p className="text-muted-foreground">No keys yet. Nostr clients don't need one; anything else does.</p>
+        <EmptyState icon={KeyRound}>No keys yet. Nostr clients don't need one; anything else does.</EmptyState>
       ) : (
         <KeyTable keys={live} onEdit={setEditing} onRevoke={setRevoking} />
       )}
 
       {revoked.length > 0 && (
         <section className="space-y-3">
-          <h2 className="text-lg font-semibold tracking-tight">Revoked</h2>
+          <SectionHeader title="Revoked" />
           <KeyTable keys={revoked} />
         </section>
       )}
@@ -103,7 +101,7 @@ const PER: Record<string, string> = { daily: 'a day', weekly: 'a week', monthly:
 
 function KeyTable({ keys, onEdit, onRevoke }: { keys: ApiKey[]; onEdit?: (key: ApiKey) => void; onRevoke?: (key: ApiKey) => void }) {
   return (
-    <div className="rounded-xl border">
+    <div className="overflow-hidden rounded-xl border bg-card shadow-xs">
       <Table>
         <TableHeader>
           <TableRow>

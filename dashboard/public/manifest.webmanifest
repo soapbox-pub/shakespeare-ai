@@ -4,5 +4,7 @@
   "description": "An OpenAI-compatible AI API. Sign in with Nostr, and pay as you go by card, Lightning or bitcoin.",
   "start_url": "/",
   "display": "standalone",
-  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+  "theme_color": "#9333ea",
+  "background_color": "#f6f1fc",
+  "icons": [{ "src": "/logo.svg", "sizes": "any", "type": "image/svg+xml" }]
 }

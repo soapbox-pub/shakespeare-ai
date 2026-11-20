@@ -1,7 +1,9 @@
-import { Link2, MoreHorizontal } from 'lucide-react';
+import { Gift, Link2, MoreHorizontal } from 'lucide-react';
 import { useState } from 'react';
 
 import { CopyButton } from '@/components/CopyButton';
+import { EmptyState } from '@/components/EmptyState';
+import { SectionHeader } from '@/components/PageHeader';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,21 +40,21 @@ export function GiftcardList({ onBuy }: { onBuy: () => void }) {
 
   return (
     <section className="space-y-4">
-      <h2 className="text-xl font-semibold tracking-tight">Gift cards</h2>
+      <SectionHeader title="Gift cards" />
       {giftcards.isPending ? (
         <Skeleton className="h-24 rounded-xl" />
       ) : giftcards.isError ? (
         <p className="text-sm text-destructive">{giftcards.error.message}</p>
       ) : rows.length === 0 ? (
-        <p className="text-muted-foreground">
+        <EmptyState icon={Gift}>
           You haven't bought any.{' '}
           <Button variant="link" className="h-auto p-0" onClick={onBuy}>
             Buy credits for someone else
           </Button>
           .
-        </p>
+        </EmptyState>
       ) : (
-        <div className="rounded-xl border">
+        <div className="overflow-hidden rounded-xl border bg-card shadow-xs">
           <Table>
             <TableHeader>
               <TableRow>
