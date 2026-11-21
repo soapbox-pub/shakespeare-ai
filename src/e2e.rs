@@ -251,6 +251,30 @@ async fn streams_and_charges_by_reported_usage() {
 }
 
 #[tokio::test]
+async fn limits_the_requests_an_account_has_in_flight() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let stream = || signed("POST", "/v1/chat/completions", Some(json!({ "model": "paid", "stream": true, "messages": [{ "role": "user", "content": "hi" }] })));
+    let mut running = Vec::new();
+    for _ in 0..crate::app::MAX_IN_FLIGHT {
+        let response = router(app.clone()).oneshot(stream()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        running.push(response);
+    }
+    let (status, body) = json_of(router(app.clone()).oneshot(stream()).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_concurrent_requests")));
+    // Images count too.
+    let image = signed("POST", "/v1/images/generations", Some(json!({ "model": "gpt-image-1", "prompt": "a cat", "quality": "low" })));
+    assert_eq!(router(app.clone()).oneshot(image).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Each place comes back once its generation is charged, read or not.
+    drop(running);
+    wait_for_generations(&app, crate::app::MAX_IN_FLIGHT as i64).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(router(app.clone()).oneshot(stream()).await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn charges_an_estimate_when_the_client_hangs_up() {
     let (app, _t) = setup().await;
     give(&app, 1);

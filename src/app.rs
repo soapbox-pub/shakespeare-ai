@@ -28,6 +28,35 @@ pub struct App {
     pub metrics: Metrics,
     pub limiter: RateLimiter,
     pub dashboard: crate::dashboard::Source,
+    /// Inference requests each account has in flight.
+    in_flight: Mutex<HashMap<String, usize>>,
+}
+
+/// How many inference requests one account may have running at once.
+///
+/// Credit is checked before a request and charged after it, so a balance can
+/// end below zero by what was in flight when it ran out. This is what bounds
+/// that: at most this many requests, each as dear as a provider's own output
+/// limit lets it be.
+pub const MAX_IN_FLIGHT: usize = 4;
+
+/// One of an account's [`MAX_IN_FLIGHT`] places, given back when dropped:
+/// when the request is charged, or abandoned.
+pub struct Slot {
+    app: Arc<App>,
+    pubkey: String,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut in_flight = self.app.in_flight.lock();
+        if let Some(n) = in_flight.get_mut(&self.pubkey) {
+            *n -= 1;
+            if *n == 0 {
+                in_flight.remove(&self.pubkey);
+            }
+        }
+    }
 }
 
 impl App {
@@ -39,7 +68,32 @@ impl App {
             // minutes, but an upstream silent this long is gone.
             .read_timeout(Duration::from_secs(600))
             .build()?;
-        Ok(App { config, db, http, rates: Rates::default(), metrics: Metrics::default(), limiter: RateLimiter::default(), dashboard: crate::dashboard::source() })
+        Ok(App {
+            config,
+            db,
+            http,
+            rates: Rates::default(),
+            metrics: Metrics::default(),
+            limiter: RateLimiter::default(),
+            dashboard: crate::dashboard::source(),
+            in_flight: Mutex::default(),
+        })
+    }
+
+    /// A place for one more inference request from `pubkey`, if it has one.
+    pub fn take_slot(self: &Arc<Self>, pubkey: &str) -> Result<Slot, ApiError> {
+        let mut in_flight = self.in_flight.lock();
+        let n = in_flight.entry(pubkey.to_string()).or_default();
+        if *n >= MAX_IN_FLIGHT {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "too_many_concurrent_requests",
+                format!("At most {MAX_IN_FLIGHT} requests can run at once. Wait for one to finish."),
+            ));
+        }
+        *n += 1;
+        Ok(Slot { app: self.clone(), pubkey: pubkey.to_string() })
     }
 
     /// The pubkey a request's NIP-98 header was signed by. Only NIP-98 will

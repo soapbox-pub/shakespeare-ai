@@ -149,6 +149,12 @@ a key can end a little past its limit, and concurrent requests can each pass
 the check. Images are checked against the most they could cost. An account can
 have 100 keys that aren't revoked.
 
+A balance can end below zero the same way, by what was running when it ran
+out. An account (all its keys and NIP-98 together) may have only 4 inference
+requests in flight; a fifth is a 429, `too_many_concurrent_requests`. With
+`n` gone, that bounds how far below zero anyone can go: four requests, each as
+dear as its provider's own output limit allows.
+
 ## Storage
 
 SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.

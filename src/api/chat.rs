@@ -36,6 +36,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     let (provider_name, upstream_model) = model.upstream();
     let provider = app.config.providers.get(provider_name).ok_or_else(not_found)?;
     let free = model.is_free_chat();
+    let slot = app.take_slot(&caller.pubkey)?;
 
     // Credit is checked before and charged after: a request's cost isn't
     // known until it's done, so a balance can end a little below zero.
@@ -76,6 +77,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         free,
         use_reported_cost: provider.openrouter,
         prompt_bytes: upstream_body.len(),
+        _slot: slot,
     };
 
     if stream {
@@ -191,6 +193,8 @@ struct Meter {
     /// and all); with it, that's the charge rather than the list price.
     use_reported_cost: bool,
     prompt_bytes: usize,
+    /// Held until the generation is charged, however it ends.
+    _slot: crate::app::Slot,
 }
 
 struct Charge {

@@ -33,6 +33,7 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     };
     let (provider_name, upstream_model) = model.upstream();
     let provider = app.config.providers.get(provider_name).ok_or_else(not_found)?;
+    let _slot = app.take_slot(&pubkey)?;
 
     // Until the provider says what it made, assume the dearest it could
     // have: without a quality it picks one itself.
