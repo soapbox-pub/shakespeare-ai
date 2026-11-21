@@ -6,11 +6,11 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
-use axum::Json;
+use axum::{Extension, Json};
 use serde_json::{json, Value};
 
 use super::{list_response, page_limit, tagged, ApiError};
-use crate::app::App;
+use crate::app::{App, ClientIp};
 use crate::money::{decimal_from_json_number, Money};
 use crate::store::{self, Method as PaymentMethod};
 
@@ -46,8 +46,8 @@ pub async fn methods(State(app): State<Arc<App>>) -> Json<Value> {
 const PAYMENTS_PER_ACCOUNT: u32 = 10;
 const PAYMENTS_PER_IP: u32 = 30;
 
-pub async fn add(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
-    app.limiter.check("payments", &headers, PAYMENTS_PER_IP)?;
+pub async fn add(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+    app.limiter.check("payments", &ip, PAYMENTS_PER_IP)?;
     let pubkey = app.authenticate(&method, &uri, &headers, &body)?;
     let who = pubkey.clone();
     let started = app.db.call(move |conn| store::payments_started(conn, &who, crate::util::now() - 3600)).await?;

@@ -86,13 +86,23 @@ fn main() -> Result<()> {
 fn serve(config: Config, db: Db) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
-        let listen = config.listen;
+        let (listen, metrics_listen) = (config.listen, config.metrics_listen);
         let app = Arc::new(app::App::new(config, db)?);
         tokio::spawn(payments::poll(app.clone()));
 
+        // Metrics are for the operator, on an address of their own that the
+        // proxy doesn't serve.
+        if let Some(address) = metrics_listen {
+            let listener = tokio::net::TcpListener::bind(address).await.with_context(|| format!("listening on {address} for metrics"))?;
+            log::info("metrics.listening", serde_json::json!({ "address": address.to_string() }));
+            let router = app::metrics_router(app.clone());
+            tokio::spawn(async move { axum::serve(listener, router).await });
+        }
+
         let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
         log::info("server.listening", serde_json::json!({ "address": listen.to_string() }));
-        axum::serve(listener, app::router(app)).with_graceful_shutdown(shutdown()).await?;
+        let service = app::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        axum::serve(listener, service).with_graceful_shutdown(shutdown()).await?;
         Ok(())
     })
 }

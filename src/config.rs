@@ -22,6 +22,16 @@ use crate::payments::bitcoin::Wallet;
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
+    /// Where to serve Prometheus metrics, apart from clients. Unset, they
+    /// aren't served.
+    #[serde(default)]
+    pub metrics_listen: Option<SocketAddr>,
+    /// The header a reverse proxy puts the client's IP in, such as
+    /// `x-real-ip` or `x-forwarded-for` (whose last address is the one the
+    /// proxy saw). Unset, it's the address that connected. Rate limits and
+    /// logs go by it.
+    #[serde(default, deserialize_with = "header_name")]
+    pub real_ip_header: Option<axum::http::HeaderName>,
     /// The public URL clients reach this service at; NIP-98 events are
     /// signed for it.
     pub origin: url::Url,
@@ -34,6 +44,13 @@ pub struct Config {
 
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8000))
+}
+
+fn header_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<axum::http::HeaderName>, D::Error> {
+    let raw = Option::<String>::deserialize(deserializer)?;
+    raw.filter(|name| !name.trim().is_empty())
+        .map(|name| axum::http::HeaderName::from_bytes(name.trim().to_ascii_lowercase().as_bytes()).map_err(|_| serde::de::Error::custom(format!("{name:?} isn't a header name"))))
+        .transpose()
 }
 
 #[derive(Debug, Deserialize)]

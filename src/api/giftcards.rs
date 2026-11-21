@@ -7,11 +7,11 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde_json::{json, Value};
 
 use super::{list_response, page_limit, tagged, ApiError};
-use crate::app::App;
+use crate::app::{App, ClientIp};
 use crate::money::{decimal_from_json_number, Money};
 use crate::store::{self, GiftcardError};
 
@@ -66,8 +66,8 @@ pub async fn create(State(app): State<Arc<App>>, method: Method, uri: Uri, heade
     }
 }
 
-pub async fn redeem(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
-    app.limiter.check("redeem", &headers, REDEEM_LIMIT)?;
+pub async fn redeem(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+    app.limiter.check("redeem", &ip, REDEEM_LIMIT)?;
     let pubkey = app.authenticate(&method, &uri, &headers, &body)?;
     let request = super::json_object(&body)?;
     let code = request
@@ -91,8 +91,8 @@ pub async fn redeem(State(app): State<Arc<App>>, method: Method, uri: Uri, heade
 }
 
 /// Anyone holding a code may look it up, without signing in.
-pub async fn check(State(app): State<Arc<App>>, Path(code): Path<String>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    app.limiter.check("check", &headers, CHECK_LIMIT)?;
+pub async fn check(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>, Path(code): Path<String>) -> Result<Json<Value>, ApiError> {
+    app.limiter.check("check", &ip, CHECK_LIMIT)?;
     let code = normalize_code(&code);
     let lookup = code.clone();
     let card = app.db.call(move |conn| store::giftcard_by_code(conn, &lookup)).await?;

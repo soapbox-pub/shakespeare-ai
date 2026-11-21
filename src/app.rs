@@ -1,10 +1,11 @@
 //! The service's shared state, and its routes.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -199,7 +200,6 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route("/metrics", get(metrics))
         .route("/v1/models", get(api::models::list))
         .route("/v1/chat/completions", post(api::chat::completions))
         .route("/v1/images/generations", post(api::images::generations))
@@ -235,6 +235,11 @@ async fn fallback(State(app): State<Arc<App>>, method: Method, uri: axum::http::
     tokio::task::spawn_blocking(move || app.dashboard.serve(&path, &headers)).await.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Prometheus metrics, served on `metrics_listen` alone.
+pub fn metrics_router(app: Arc<App>) -> Router {
+    Router::new().route("/metrics", get(metrics)).with_state(app)
+}
+
 async fn metrics(State(app): State<Arc<App>>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], app.metrics.render())
 }
@@ -259,16 +264,46 @@ async fn cors(request: Request, next: Next) -> Response {
     response
 }
 
-/// Log each request and its response, and count responses by route.
-async fn observe(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+/// The client's IP, as [`observe`] found it for each request: `None` only
+/// when nothing says (a request made in a test).
+#[derive(Clone, Debug)]
+pub struct ClientIp(pub Option<IpAddr>);
+
+impl App {
+    /// The client's IP: from the configured header if it's set and makes
+    /// sense, else the peer's. Proxies append to `X-Forwarded-For`, so the
+    /// last address in a list is the one the nearest proxy saw.
+    fn client_ip(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+        let peer = peer.map(|p| p.ip());
+        let Some(name) = &self.config.real_ip_header else { return peer };
+        let header = headers.get(name).and_then(|v| v.to_str().ok());
+        let ip = header.and_then(|v| v.rsplit(',').next()?.trim().parse().ok());
+        if ip.is_none() && peer.is_some() {
+            crate::log::warn("http.client_ip", serde_json::json!({ "header": name.as_str(), "value": header }));
+        }
+        ip.or(peer)
+    }
+}
+
+/// Find the client's IP, log each request and its response, and count
+/// responses by route.
+async fn observe(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let pathname = request.uri().path().to_string();
     let route = request.extensions().get::<MatchedPath>().map_or_else(|| "unmatched".to_string(), |p| p.as_str().to_string());
-    let ip = request.headers().get("x-real-ip").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let ip = app.client_ip(request.headers(), peer);
+    request.extensions_mut().insert(ClientIp(ip));
     let start = Instant::now();
     let response = next.run(request).await;
     let status = response.status().as_u16();
-    app.metrics.response(method.as_str(), &route, status);
+    // Any token is a method to HTTP; only the usual ones get labels of
+    // their own, so nobody can grow the metrics without end.
+    let label = match method {
+        Method::GET | Method::HEAD | Method::POST | Method::PUT | Method::PATCH | Method::DELETE | Method::OPTIONS => method.as_str(),
+        _ => "OTHER",
+    };
+    app.metrics.response(label, &route, status);
     let level = if status >= 500 { crate::log::error } else { crate::log::info };
     level(
         "http.response",
@@ -277,17 +312,17 @@ async fn observe(State(app): State<Arc<App>>, request: Request, next: Next) -> R
             "pathname": pathname,
             "status": status,
             "duration": start.elapsed().as_secs_f64(),
-            "ip": ip,
+            "ip": ip.map(|ip| ip.to_string()),
         }),
     );
     response
 }
 
 /// Fixed hourly windows per client IP, for the endpoints that guess at gift
-/// card codes. Only behind a proxy that sets `X-Real-IP`; without one there's
-/// no telling clients apart.
+/// card codes or make payments. Behind a proxy, `real_ip_header` must be set,
+/// or every client is the proxy.
 /// (bucket, IP) → when its window started, and requests in it.
-type Windows = HashMap<(&'static str, String), (Instant, u32)>;
+type Windows = HashMap<(&'static str, IpAddr), (Instant, u32)>;
 
 #[derive(Default)]
 pub struct RateLimiter {
@@ -297,16 +332,14 @@ pub struct RateLimiter {
 const WINDOW: Duration = Duration::from_secs(60 * 60);
 
 impl RateLimiter {
-    pub fn check(&self, bucket: &'static str, headers: &HeaderMap, limit: u32) -> Result<(), ApiError> {
-        let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) else {
-            return Ok(());
-        };
+    pub fn check(&self, bucket: &'static str, ip: &ClientIp, limit: u32) -> Result<(), ApiError> {
+        let Some(ip) = ip.0 else { return Ok(()) };
         let now = Instant::now();
         let mut windows = self.windows.lock();
         if windows.len() > 100_000 {
             windows.retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
         }
-        let entry = windows.entry((bucket, ip.to_string())).or_insert((now, 0));
+        let entry = windows.entry((bucket, ip)).or_insert((now, 0));
         if now.duration_since(entry.0) >= WINDOW {
             *entry = (now, 0);
         }
@@ -315,5 +348,44 @@ impl RateLimiter {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "rate_limited", "Too many requests, please try again later."));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(extra: &str) -> App {
+        let yaml = format!("origin: https://ai.example.com\ndatabase: unused.sqlite3\nproviders: {{}}\nmodels: {{}}\n{extra}");
+        App::new(Config::parse(&yaml).unwrap(), crate::db::testing::temp_db().db.clone()).unwrap()
+    }
+
+    #[test]
+    fn finds_the_client_ip() {
+        let peer = Some(SocketAddr::from(([127, 0, 0, 1], 5000)));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("6.6.6.6, 1.2.3.4"));
+        headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+
+        // Unset, it's whoever connected: a header is anyone's to send.
+        assert_eq!(app("").client_ip(&headers, peer), ip("127.0.0.1"));
+        // The last forwarded address is the one the proxy saw.
+        assert_eq!(app("real_ip_header: X-Forwarded-For\n").client_ip(&headers, peer), ip("1.2.3.4"));
+        assert_eq!(app("real_ip_header: x-real-ip\n").client_ip(&headers, peer), ip("9.9.9.9"));
+        assert_eq!(app("real_ip_header: cf-connecting-ip\n").client_ip(&headers, peer), ip("127.0.0.1"));
+        assert!(Config::parse("origin: https://a.example\ndatabase: x\nproviders: {}\nmodels: {}\nreal_ip_header: \"no good\"\n").is_err());
+    }
+
+    #[test]
+    fn limits_by_ip() {
+        let limiter = RateLimiter::default();
+        let (one, two) = (ClientIp(Some([1, 1, 1, 1].into())), ClientIp(Some([2, 2, 2, 2].into())));
+        assert!(limiter.check("x", &one, 2).is_ok());
+        assert!(limiter.check("x", &one, 2).is_ok());
+        assert!(limiter.check("x", &one, 2).is_err());
+        assert!(limiter.check("y", &one, 2).is_ok());
+        assert!(limiter.check("x", &two, 2).is_ok());
+        assert!(limiter.check("x", &ClientIp(None), 0).is_ok());
     }
 }

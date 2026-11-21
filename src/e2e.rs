@@ -618,6 +618,23 @@ async fn validates_api_keys() {
 }
 
 #[tokio::test]
+async fn serves_metrics_apart_from_clients() {
+    let (app, _t) = setup().await;
+    let request = |method: &str, path: &str| Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+    router(app.clone()).oneshot(request("BREW", "/v1/models")).await.unwrap();
+    router(app.clone()).oneshot(request("GET", "/v1/models")).await.unwrap();
+
+    let response = router(app.clone()).oneshot(request("GET", "/metrics")).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&body).contains("shakespeare_"));
+
+    let response = crate::app::metrics_router(app.clone()).oneshot(request("GET", "/metrics")).await.unwrap();
+    let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(text.contains(r#"method="GET",path="/v1/models",status="200""#), "{text}");
+    assert!(text.contains(r#"method="OTHER""#) && !text.contains("BREW"), "{text}");
+}
+
+#[tokio::test]
 async fn leaves_unknown_api_paths_to_the_api() {
     let (app, _t) = setup().await;
     for (method, path) in [("GET", "/v1/nope"), ("GET", "/v1"), ("POST", "/credits"), ("GET", "/webhooks/nope")] {

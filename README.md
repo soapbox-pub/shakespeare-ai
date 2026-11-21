@@ -21,8 +21,15 @@ shakespeare-ai --config config.yaml serve
 `--config` defaults to `$SHAKESPEARE_AI_CONFIG`, then `./config.yaml`. The
 database is one SQLite file, created and migrated on start.
 
-Put it behind a reverse proxy that sets `X-Real-IP` (the gift card and
-payment endpoints rate-limit by it) and doesn't buffer `text/event-stream` responses.
+Put it behind a reverse proxy that doesn't buffer `text/event-stream`
+responses, and that puts the client's IP in a header: set `real_ip_header` to
+it (`x-real-ip`, or `x-forwarded-for`, whose last address is used). The gift
+card and payment endpoints rate-limit by that IP, and the logs show it.
+Unset, the IP is the address that connected, which behind a proxy is the
+proxy's, so every client would share one limit.
+
+Prometheus metrics are served on `metrics_listen`, apart from clients, if
+it's set: `http://<metrics_listen>/metrics`.
 
 Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
 `checkout.session.completed`.
@@ -50,8 +57,7 @@ terms at `/docs` and `/terms`. A gift card's link is
 `/credits#redeem=<code>`, the code in the fragment so it stays out of logs. It has no API of its own. It signs each request to the public API with
 NIP-98, as any client does, so there are no sessions or cookies.
 
-Any path that isn't the API's (`/v1/…`, `/webhooks/…`,
-`/metrics`) is the dashboard's: a file, or its directory's `index.html`, or
+Any path that isn't the API's (`/v1/…`, `/webhooks/…`) is the dashboard's: a file, or its directory's `index.html`, or
 else `200.html`, the app with no page in it.
 
 `npm run build` prerenders the public pages (`/`, `/docs` and `/terms`, as

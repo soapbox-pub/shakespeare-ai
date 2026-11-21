@@ -4,6 +4,15 @@
 
 listen: 127.0.0.1:8000
 
+# Where to serve Prometheus metrics (/metrics), apart from clients. Unset,
+# they aren't served.
+metrics_listen: 127.0.0.1:9100
+
+# The header the reverse proxy puts the client's IP in: x-real-ip, or
+# x-forwarded-for (its last address). Rate limits and logs go by it. Unset,
+# it's the address that connected, which behind a proxy is the proxy's.
+real_ip_header: x-real-ip
+
 # The public URL clients reach this service at. NIP-98 auth events are signed
 # for it, so it must match what clients see, not what this process sees.
 origin: https://ai.shakespeare.diy
