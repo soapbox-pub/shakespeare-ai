@@ -80,10 +80,10 @@ directory, beside the binary or in the source tree, so build it first:
 YAML; see `config.example.yaml`, which documents every field. In short:
 
 - **routing**: how hard to try a model's upstreams (see below).
-- **providers**: upstream APIs, each an `api` (the protocol: `openai`, or
-  `openrouter` for OpenAI's with OpenRouter's usage accounting and Anthropic
-  prompt caching breakpoints), an `api_key`, and a `base_url` if it isn't the
-  usual one for `api`.
+- **providers**: upstream APIs, each an `api` (the protocol: `openai`;
+  `openrouter`, OpenAI's with OpenRouter's usage accounting and Anthropic
+  prompt caching breakpoints; or `anthropic`, see below), an `api_key`, and a
+  `base_url` if it isn't the usual one for `api`.
 - **models**: what clients ask for by id, each with a list of `upstreams`
   tried in order. An upstream is `provider/model`, everything after the first
   slash being the provider's own id (`openrouter/anthropic/claude-sonnet-4.6`),
@@ -122,6 +122,31 @@ it, and what it cost us when the provider says (OpenRouter does), for an
 operator to see the margin by route; neither is shown to clients. The one
 exception is a free model an upstream charged us for anyway, which is charged
 on at that cost.
+
+## Anthropic
+
+A provider with `api: anthropic` is spoken to in Anthropic's Messages API
+(version `2023-06-01`), so clients keep speaking OpenAI's chat API while
+direct Claude requests get prompt caching: breakpoints go on the last tool,
+the end of the system prompt and the last two messages, as for OpenRouter's
+`anthropic/` models. Usage comes back in OpenAI's terms, with cached input in
+`prompt_tokens` and broken out in `prompt_tokens_details`.
+
+- `max_tokens` is required by Anthropic, so it's 16384 when the client
+  doesn't say.
+- `reasoning_effort` asks Claude 4.6 and later for adaptive thinking at that
+  effort (`minimal` is `low`, and Claude 4.6's `xhigh` is `high`), and
+  earlier models for a thinking budget (1024 to 32768 tokens), left out when
+  `max_tokens` has no room for one or a tool call is forced. Claude 5 and
+  later think anyway, and are asked to show it. With thinking asked for,
+  `temperature` and `top_p` are left out, as Anthropic refuses them.
+- Thinking comes back as OpenRouter spells it: `reasoning` for the text, and
+  `reasoning_details` for the signed blocks, which clients hand back (tool
+  use needs them) as they would to OpenRouter. Streams send each thinking
+  block's detail whole, once it's signed.
+- `response_format` with a `json_schema` becomes `output_config.format`;
+  `json_object` has no equivalent and is left out, as are `seed` and the
+  penalties.
 
 ## Lightning
 

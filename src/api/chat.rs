@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
+use super::anthropic;
 use super::schema::ChatRequest;
 use super::upstream::{self, upstream_failure, Failure};
 use super::ApiError;
@@ -62,7 +63,8 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         async move {
             let label = upstream.label();
             let prompt_bytes = body.len();
-            let response = upstream::post(app, provider, &label, "chat/completions", body).await?;
+            let path = if provider.api == Api::Anthropic { "messages" } else { "chat/completions" };
+            let response = upstream::post(app, provider, &label, path, body).await?;
             if !stream {
                 return Ok(Attempt { reply: Reply::Whole(response), prompt_bytes });
             }
@@ -82,7 +84,8 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     })
     .await?;
 
-    let openrouter = app.config.providers.get(&upstream.provider).is_some_and(|p| p.api == Api::Openrouter);
+    let api = app.config.providers.get(&upstream.provider).map_or(Api::Openai, |p| p.api);
+    let openrouter = api == Api::Openrouter;
     let meter = Meter {
         app: app.clone(),
         api_key_id: caller.api_key_id(),
@@ -98,9 +101,12 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     };
 
     match attempt.reply {
-        Reply::Stream(events) => Ok(stream_response(meter, events)),
+        Reply::Stream(events) => Ok(stream_response(meter, events, (api == Api::Anthropic).then(anthropic::Stream::default))),
         Reply::Whole(response) => {
             let mut completion: Value = response.json().await.map_err(|e| upstream_failure(&e.to_string()))?;
+            if api == Api::Anthropic {
+                completion = anthropic::completion(&completion);
+            }
             let usage = completion.get("usage").cloned().unwrap_or(Value::Null);
             let content_bytes = completion.pointer("/choices/0/message").map_or(0, |m| m.to_string().len());
             let upstream_id = completion.get("id").and_then(Value::as_str).map(str::to_string);
@@ -138,7 +144,10 @@ enum Reply {
 /// provider's dialect, with the upstream's own `params` over it.
 fn upstream_body(request: &ChatRequest, upstream: &Upstream, provider: &Provider) -> Vec<u8> {
     let openrouter = provider.api == Api::Openrouter;
-    let mut body = request.upstream(&upstream.model, openrouter);
+    let mut body = match provider.api {
+        Api::Anthropic => anthropic::request(request, &upstream.model),
+        Api::Openai | Api::Openrouter => request.upstream(&upstream.model, openrouter),
+    };
     if openrouter {
         // https://openrouter.ai/docs/use-cases/usage-accounting
         body.insert("usage".into(), json!({ "include": true }));
@@ -344,7 +353,7 @@ impl Meter {
 /// The relaying runs in a task of its own, so that if the client goes away
 /// the generation is still charged for: by its reported usage if that has
 /// arrived, or else by an estimate of what was sent and received.
-fn stream_response(meter: Meter, mut events: BoxStream<'static, reqwest::Result<Bytes>>) -> Response {
+fn stream_response(meter: Meter, mut events: BoxStream<'static, reqwest::Result<Bytes>>, mut anthropic: Option<anthropic::Stream>) -> Response {
     let (tx, mut rx) = mpsc::channel::<Bytes>(64);
     tokio::spawn(async move {
         let mut parser = SseParser::default();
@@ -353,7 +362,13 @@ fn stream_response(meter: Meter, mut events: BoxStream<'static, reqwest::Result<
 
         'read: while let Some(chunk) = events.next().await {
             let Ok(chunk) = chunk else { break };
-            for data in parser.push(&chunk) {
+            let received = parser.push(&chunk);
+            // Anthropic's events, rewritten as OpenAI's chunks first.
+            let received = match &mut anthropic {
+                Some(translator) => received.iter().flat_map(|data| translator.push(data)).collect(),
+                None => received,
+            };
+            for data in received {
                 if data == "[DONE]" {
                     break 'read;
                 }

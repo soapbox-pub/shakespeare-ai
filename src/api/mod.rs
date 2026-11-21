@@ -1,5 +1,6 @@
 //! The HTTP API: OpenAI-shaped, errors included.
 
+pub mod anthropic;
 pub mod chat;
 pub mod credits;
 pub mod giftcards;

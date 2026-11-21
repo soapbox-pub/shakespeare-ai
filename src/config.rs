@@ -240,6 +240,8 @@ pub enum Api {
     /// reasoning blocks handed back, usage accounting (what each request
     /// cost us), and prompt caching breakpoints for `anthropic/` models.
     Openrouter,
+    /// Anthropic's Messages API, with prompt caching. Chat only.
+    Anthropic,
 }
 
 impl Provider {
@@ -247,6 +249,7 @@ impl Provider {
         let default = match self.api {
             Api::Openai => "https://api.openai.com/v1",
             Api::Openrouter => "https://openrouter.ai/api/v1",
+            Api::Anthropic => "https://api.anthropic.com/v1",
         };
         self.base_url.clone().unwrap_or_else(|| url::Url::parse(default).expect("a URL"))
     }

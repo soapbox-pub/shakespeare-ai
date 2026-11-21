@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use super::ApiError;
 use crate::app::App;
-use crate::config::{Provider, Routing, Upstream};
+use crate::config::{Api, Provider, Routing, Upstream};
 
 /// How each upstream has fared lately, by its label.
 #[derive(Default)]
@@ -103,7 +103,11 @@ where
 /// of the client's request goes with it but the body we wrote.
 pub async fn post(app: &App, provider: &Provider, label: &str, path: &str, body: Vec<u8>) -> Result<reqwest::Response, Failure> {
     let url = format!("{}/{path}", provider.base_url().as_str().trim_end_matches('/'));
-    let request = app.http.post(url).bearer_auth(&provider.api_key).header(header::CONTENT_TYPE, "application/json").body(body);
+    let request = app.http.post(url).header(header::CONTENT_TYPE, "application/json").body(body);
+    let request = match provider.api {
+        Api::Anthropic => request.header("x-api-key", &provider.api_key).header("anthropic-version", super::anthropic::VERSION),
+        Api::Openai | Api::Openrouter => request.bearer_auth(&provider.api_key),
+    };
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => return Err(Failure::Retry(upstream_failure(&format!("{label}: {error}")))),

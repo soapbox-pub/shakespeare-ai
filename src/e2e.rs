@@ -79,8 +79,39 @@ async fn fake_upstream() -> String {
         });
         ([("content-type", "text/event-stream")], Body::from_stream(stream))
     }
+    async fn messages(headers: axum::http::HeaderMap, body: Bytes) -> axum::response::Response {
+        assert_eq!(headers["x-api-key"], "test");
+        assert_eq!(headers["anthropic-version"], crate::api::anthropic::VERSION);
+        assert!(headers.get("authorization").is_none());
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["model"], "claude-test");
+        assert_eq!(request["system"], json!([{ "type": "text", "text": "be brief", "cache_control": { "type": "ephemeral" } }]));
+        assert_eq!(request["messages"], json!([{ "role": "user", "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }] }]));
+        assert_eq!(request["max_tokens"], 16384);
+        let usage = json!({ "input_tokens": 100, "cache_read_input_tokens": 600, "cache_creation_input_tokens": 300, "output_tokens": 1000 });
+        if request["stream"] == true {
+            let events = [
+                json!({ "type": "message_start", "message": { "id": "msg_1", "model": "claude-test", "usage": { "input_tokens": 100, "cache_read_input_tokens": 600, "cache_creation_input_tokens": 300, "output_tokens": 1 } } }),
+                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+                json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hel" } }),
+                json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "lo" } }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 1000 } }),
+                json!({ "type": "message_stop" }),
+            ];
+            let text: String = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
+            return ([("content-type", "text/event-stream")], text).into_response();
+        }
+        axum::Json(json!({
+            "id": "msg_2", "type": "message", "role": "assistant", "model": "claude-test", "stop_reason": "end_turn",
+            "content": [{ "type": "text", "text": "Hi" }],
+            "usage": usage,
+        }))
+        .into_response()
+    }
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/anthropic/v1/messages", post(messages))
         .route("/v1/images/generations", post(images))
         .route("/down/v1/chat/completions", post(down))
         .route("/down/v1/images/generations", post(down))
@@ -120,6 +151,10 @@ providers:
     api: openai
     base_url: {root}/silent/v1
     api_key: test
+  claude:
+    api: anthropic
+    base_url: {root}/anthropic/v1
+    api_key: test
 routing:
   first_byte_timeout: 300ms
   failures: 2
@@ -140,6 +175,11 @@ models:
     upstreams: [refuses/upstream-model, fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
+  claude:
+    hidden: true
+    upstreams: [claude/claude-test]
+    context_window: 1000
+    price: {{ input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }}
   cached:
     hidden: true
     upstreams: [router/upstream-model]
@@ -359,6 +399,40 @@ async fn prices_cached_input_and_records_what_it_cost_us() {
         .with(|conn| Ok(conn.query_row("SELECT cache_read_tokens, cache_write_tokens, upstream_cost, upstream FROM generations", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
         .unwrap();
     assert_eq!(row, (600, 100, Some(500_000_000), "router/upstream-model".into()));
+}
+
+#[tokio::test]
+async fn speaks_anthropic_to_anthropic() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let messages = json!([{ "role": "system", "content": "be brief" }, { "role": "user", "content": "hi" }]);
+    // 100 uncached × $3/M + 600 read × $0.30/M + 300 written × $3.75/M +
+    // 1000 out × $15/M.
+    let cost = 0.016605;
+
+    let request = signed("POST", "/v1/chat/completions", Some(json!({ "model": "claude", "messages": messages })));
+    let (status, body) = json_of(router(app.clone()).oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((&body["model"], &body["object"]), (&json!("claude"), &json!("chat.completion")));
+    assert_eq!(body["choices"][0]["message"], json!({ "role": "assistant", "content": "Hi" }));
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 1000);
+    assert_eq!(body["usage"]["prompt_tokens_details"], json!({ "cached_tokens": 600, "cache_write_tokens": 300 }));
+    assert_eq!(body["usage"]["cost"], cost);
+
+    let request = signed("POST", "/v1/chat/completions", Some(json!({ "model": "claude", "stream": true, "messages": messages })));
+    let response = router(app.clone()).oneshot(request).await.unwrap();
+    let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    let chunks: Vec<Value> = text.split("\n\n").filter_map(|e| e.strip_prefix("data: ")).filter(|d| *d != "[DONE]").map(|d| serde_json::from_str(d).unwrap()).collect();
+    let content: String = chunks.iter().filter_map(|c| c.pointer("/choices/0/delta/content").and_then(Value::as_str)).collect();
+    assert_eq!(content, "Hello");
+    assert!(chunks.iter().all(|c| c["model"] == "claude"));
+    assert_eq!(chunks.last().unwrap()["usage"]["cost"], cost, "{text}");
+    assert!(text.ends_with("data: [DONE]\n\n"));
+
+    let rows = wait_for_generations(&app, 2).await;
+    assert_eq!(rows, [(16_605_000, 0), (16_605_000, 0)]);
+    assert_eq!(balance(&app), Money(1_000_000_000 - 2 * 16_605_000));
 }
 
 #[tokio::test]

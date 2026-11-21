@@ -59,14 +59,14 @@ routing:
   failures: 3
   cooldown: 30s
 
-# Upstream APIs. `api` is the protocol: `openai`, or `openrouter` for
-# OpenAI's with OpenRouter's extras (usage accounting, which records what
-# each request cost us, and prompt caching breakpoints for anthropic/
-# models). `base_url` defaults to the usual one for `api`.
+# Upstream APIs. `api` is the protocol: `openai`; `openrouter`, OpenAI's with
+# OpenRouter's extras (usage accounting, which records what each request cost
+# us, and prompt caching breakpoints for anthropic/ models); or `anthropic`,
+# Anthropic's Messages API, with prompt caching (chat only). `base_url`
+# defaults to the usual one for `api`.
 providers:
   anthropic:
-    api: openai
-    base_url: https://api.anthropic.com/v1
+    api: anthropic
     api_key: ${ANTHROPIC_API_KEY}
   openrouter:
     api: openrouter
