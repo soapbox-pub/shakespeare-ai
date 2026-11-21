@@ -31,7 +31,12 @@ fn describe(id: &str, model: &Model) -> Value {
             let per_token = |p: Decimal| (p / Decimal::from(1_000_000)).normalize().to_string();
             out["type"] = "chat".into();
             out["context_window"] = model.context_window.into();
-            out["pricing"] = json!({ "prompt": per_token(price.input), "completion": per_token(price.output) });
+            out["pricing"] = json!({
+                "prompt": per_token(price.input),
+                "completion": per_token(price.output),
+                "input_cache_read": per_token(price.cache_read()),
+                "input_cache_write": per_token(price.cache_write()),
+            });
         }
         Price::Image(price) => {
             let s = |p: Decimal| p.normalize().to_string();

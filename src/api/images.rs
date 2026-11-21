@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::Json;
 use serde_json::{json, Map, Value};
 
-use super::chat::{send, upstream_failure};
+use super::upstream::{self, upstream_failure};
 use super::ApiError;
 use crate::app::App;
 use crate::config::{ImagePrice, Price};
@@ -31,8 +31,6 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         return Err(ApiError::invalid("invalid_model_type", format!("Model '{}' cannot be used with the image generations endpoint", params.model))
             .param("model"));
     };
-    let (provider_name, upstream_model) = model.upstream();
-    let provider = app.config.providers.get(provider_name).ok_or_else(not_found)?;
     let _slot = app.take_slot(&pubkey)?;
 
     // Until the provider says what it made, assume the dearest it could
@@ -53,20 +51,28 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         .with("available", balance.to_f64()));
     }
 
-    let mut upstream = Map::new();
-    upstream.insert("model".into(), upstream_model.into());
-    upstream.insert("prompt".into(), params.prompt.into());
+    let mut body = Map::new();
+    body.insert("prompt".into(), params.prompt.clone().into());
     for (key, value) in [("n", params.n.map(Value::from)), ("quality", params.quality.clone().map(Value::from)), ("size", params.size.clone().map(Value::from))] {
         if let Some(value) = value {
-            upstream.insert(key.into(), value);
+            body.insert(key.into(), value);
         }
     }
     for key in ["output_format", "output_compression"] {
         if let Some(value) = request.get(key).filter(|v| !v.is_null()) {
-            upstream.insert(key.into(), value.clone());
+            body.insert(key.into(), value.clone());
         }
     }
-    let response = send(&app, provider, "images/generations", serde_json::to_vec(&upstream).map_err(anyhow::Error::from)?).await?;
+    let (response, upstream) = upstream::route(&app, &params.model, &model.upstreams, |upstream, provider| {
+        let mut body = body.clone();
+        body.insert("model".into(), upstream.model.clone().into());
+        for (key, value) in &upstream.params {
+            body.insert(key.clone(), value.clone());
+        }
+        let app = &app;
+        async move { upstream::post(app, provider, &upstream.label(), "images/generations", serde_json::to_vec(&body).unwrap_or_default()).await }
+    })
+    .await?;
     let mut result: Value = response.json().await.map_err(|e| upstream_failure(&e.to_string()))?;
 
     // Charge for what was made, as the provider describes it.
@@ -85,14 +91,18 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         prompt_tokens: 0,
         // Images, counted as completion tokens, as they always have been.
         completion_tokens: u64::from(made),
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         cost,
         estimated: false,
         api_key_id: caller.api_key_id(),
+        upstream: Some(upstream.label()),
+        upstream_cost: None,
     };
     let id = generation.id.clone();
     app.metrics.usage(&params.model, 0, u64::from(made), cost);
     let recorded = app.db.call(move |conn| store::record_generation(conn, &generation)).await;
-    let fields = json!({ "pubkey": pubkey, "api_key": caller.api_key_id(), "model": params.model, "cost": cost.to_f64(), "images": made, "quality": quality, "size": size, "id": id });
+    let fields = json!({ "pubkey": pubkey, "api_key": caller.api_key_id(), "model": params.model, "cost": cost.to_f64(), "upstream": upstream.label(), "images": made, "quality": quality, "size": size, "id": id });
     match recorded {
         Ok(()) => crate::log::info("image.generation", fields),
         Err(error) => crate::log::error("image.unrecorded", json!({ "generation": fields, "error": format!("{error:#}") })),

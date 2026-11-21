@@ -44,90 +44,120 @@ payments:
     # How many blocks deep a payment must be before it's credited.
     confirmations: 1
 
-# Upstream OpenAI-compatible APIs.
+# How hard to try a model's upstreams. A request falls over to the next one
+# when an upstream can't be reached, is overloaded or down (408, 429, 5xx),
+# refuses our credentials (401-403) or hasn't got the model (404); never when
+# it refuses the request itself (another 4xx), which would fail the same way
+# anywhere, and never once anything has reached the client.
+routing:
+  connect_timeout: 10s
+  # How long a stream's first byte may take. (Non-streaming responses come
+  # whole, however long the completion takes, so only streams have it.)
+  first_byte_timeout: 60s
+  # After this many failures in a row, an upstream goes to the back of the
+  # line for `cooldown`.
+  failures: 3
+  cooldown: 30s
+
+# Upstream APIs. `api` is the protocol: `openai`, or `openrouter` for
+# OpenAI's with OpenRouter's extras (usage accounting, which records what
+# each request cost us, and prompt caching breakpoints for anthropic/
+# models). `base_url` defaults to the usual one for `api`.
 providers:
   anthropic:
+    api: openai
     base_url: https://api.anthropic.com/v1
     api_key: ${ANTHROPIC_API_KEY}
   openrouter:
-    base_url: https://openrouter.ai/api/v1
+    api: openrouter
     api_key: ${OPENROUTER_API_KEY}
-    # Usage accounting (OpenRouter reports each request's real cost) and
-    # prompt caching breakpoints for anthropic/ models.
-    openrouter: true
   openai:
-    base_url: https://api.openai.com/v1
+    api: openai
     api_key: ${OPENAI_API_KEY}
 
-# What clients ask for, by id. `upstream` is provider/model: everything after
-# the first slash is the provider's own model id. Chat prices are USD per
-# million tokens. `hidden` keeps a model out of /v1/models without disabling
-# it; free chat models are always hidden.
+# What clients ask for, by id.
+#
+# `upstreams` are tried in order. Each is provider/model, everything after the
+# first slash being the provider's own model id, or the long form
+# `{ provider, model, params }`, whose `params` are merged into each request
+# body sent that way.
+#
+# Chat prices are USD per million tokens, and are what the client pays
+# whichever upstream serves it. `cache_read` and `cache_write` price cached
+# input, and default to `input`. `hidden` keeps a model out of /v1/models
+# without disabling it; free chat models are always hidden.
 models:
   claude-sonnet-4.6:
-    upstream: anthropic/claude-sonnet-4-6
     name: Claude Sonnet 4.6
     description: Highly capable programming model, able to understand and perform complex tasks.
     context_window: 200000
-    price: { input: 3, output: 15 }
+    price: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
+    upstreams:
+      - anthropic/claude-sonnet-4-6
+      - openrouter/anthropic/claude-sonnet-4.6
 
   claude-opus-4.8:
-    upstream: anthropic/claude-opus-4-8
     name: Claude Opus 4.8
     description: If money is no obstacle, this model can get the job done.
     context_window: 200000
-    price: { input: 5, output: 25 }
+    price: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 }
+    upstreams: [anthropic/claude-opus-4-8]
 
   claude-sonnet-4.5:
-    upstream: anthropic/claude-sonnet-4-5-20250929
     name: Claude Sonnet 4.5
     hidden: true
     context_window: 200000
-    price: { input: 3, output: 15 }
+    price: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
+    upstreams: [anthropic/claude-sonnet-4-5-20250929]
 
   claude-opus-4.5:
-    upstream: anthropic/claude-opus-4-5-20251101
     name: Claude Opus 4.5
     hidden: true
     context_window: 200000
-    price: { input: 5, output: 25 }
+    price: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 }
+    upstreams: [anthropic/claude-opus-4-5-20251101]
 
   claude-opus-4.6:
-    upstream: anthropic/claude-opus-4-6
     name: Claude Opus 4.6
     hidden: true
     context_window: 200000
-    price: { input: 5, output: 25 }
+    price: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 }
+    upstreams: [anthropic/claude-opus-4-6]
 
   # Hidden: they misbehave in Shakespeare for now.
   claude-sonnet-5:
-    upstream: anthropic/claude-sonnet-5
     name: Claude Sonnet 5
     hidden: true
     context_window: 200000
-    price: { input: 2, output: 10 }
+    price: { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 }
+    upstreams: [anthropic/claude-sonnet-5]
 
   claude-opus-5:
-    upstream: anthropic/claude-opus-5
     name: Claude Opus 5
     hidden: true
     context_window: 200000
-    price: { input: 5, output: 25 }
+    price: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 }
+    upstreams: [anthropic/claude-opus-5]
 
   # Free, and so unlisted; Ditto's buddy uses it by id.
   gemma-4-26b:
-    upstream: openrouter/google/gemma-4-26b-a4b-it
     name: Gemma 4 26B A4B
     description: Google DeepMind's instruction-tuned Mixture-of-Experts model.
     context_window: 262144
     price: { input: 0, output: 0 }
+    upstreams:
+      - provider: openrouter
+        model: google/gemma-4-26b-a4b-it
+        # Merged into the request: here, it could pin OpenRouter's own routing.
+        # params: { provider: { order: [deepinfra], allow_fallbacks: false } }
 
-  # Image models are priced per image, by quality and shape.
+  # Image models are priced per image, by quality and shape, and need
+  # providers with api: openai.
   gpt-image-1:
-    upstream: openai/gpt-image-1
     name: GPT Image 1
     description: Generate high-quality images from text descriptions.
     price:
       low: { square: 0.011, wide: 0.016 }
       medium: { square: 0.042, wide: 0.063 }
       high: { square: 0.167, wide: 0.25 }
+    upstreams: [openai/gpt-image-1]

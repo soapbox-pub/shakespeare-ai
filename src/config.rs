@@ -1,13 +1,14 @@
 //! The config file, in YAML.
 //!
-//! Providers are upstream OpenAI-compatible APIs; models are what clients ask
-//! for by name, each mapped to `provider/upstream-model`. Secrets are never
-//! written into the file: any secret field may be `${ENV_VAR}`, read from the
-//! environment at startup.
+//! Providers are upstream APIs; models are what clients ask for by name, each
+//! served by a list of upstreams (`provider/upstream-model`) tried in order.
+//! Secrets are never written into the file: any secret field may be
+//! `${ENV_VAR}`, read from the environment at startup.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
@@ -38,6 +39,8 @@ pub struct Config {
     pub database: PathBuf,
     #[serde(default)]
     pub payments: Payments,
+    #[serde(default)]
+    pub routing: Routing,
     pub providers: IndexMap<String, Provider>,
     pub models: IndexMap<String, Model>,
 }
@@ -140,25 +143,168 @@ fn wallet<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Wallet, D::Error
     Wallet::parse(&raw).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
 }
 
+/// How hard to try a model's upstreams before giving up on a request.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Provider {
-    /// An OpenAI-compatible API root, such as `https://api.openai.com/v1`.
-    pub base_url: url::Url,
-    #[serde(deserialize_with = "secret")]
-    pub api_key: String,
-    /// OpenRouter extras: per-request usage accounting, and Anthropic prompt
-    /// caching breakpoints for `anthropic/` models.
-    #[serde(default)]
-    pub openrouter: bool,
+pub struct Routing {
+    /// How long connecting to a provider may take.
+    #[serde(default = "default_connect_timeout", deserialize_with = "duration")]
+    pub connect_timeout: Duration,
+    /// How long a stream's first byte may take. Non-streaming responses come
+    /// whole, however long the completion takes, so only streams have it.
+    #[serde(default = "default_first_byte_timeout", deserialize_with = "duration")]
+    pub first_byte_timeout: Duration,
+    /// Failures in a row that take an upstream out of turn for `cooldown`.
+    #[serde(default = "default_failures")]
+    pub failures: u32,
+    #[serde(default = "default_cooldown", deserialize_with = "duration")]
+    pub cooldown: Duration,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Routing {
+            connect_timeout: default_connect_timeout(),
+            first_byte_timeout: default_first_byte_timeout(),
+            failures: default_failures(),
+            cooldown: default_cooldown(),
+        }
+    }
+}
+
+fn default_connect_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_first_byte_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_failures() -> u32 {
+    3
+}
+
+fn default_cooldown() -> Duration {
+    Duration::from_secs(30)
+}
+
+/// A duration: `500ms`, `10s`, `5m` or `1h`, or a number of seconds.
+fn duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Seconds(u64),
+        Text(String),
+    }
+    let text = match Raw::deserialize(deserializer)? {
+        Raw::Seconds(s) => return Ok(Duration::from_secs(s)),
+        Raw::Text(text) => text,
+    };
+    parse_duration(&text).ok_or_else(|| serde::de::Error::custom(format!("{text:?} isn't a duration, like 500ms, 10s, 5m or 1h")))
+}
+
+fn parse_duration(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit())?;
+    let (n, unit) = text.split_at(split);
+    let n: u64 = n.parse().ok()?;
+    match unit.trim() {
+        "ms" => Some(Duration::from_millis(n)),
+        "s" => Some(Duration::from_secs(n)),
+        "m" => Some(Duration::from_secs(n.checked_mul(60)?)),
+        "h" => Some(Duration::from_secs(n.checked_mul(3600)?)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Provider {
+    /// The protocol it speaks.
+    pub api: Api,
+    /// Its API root, if not the usual one for `api`.
+    #[serde(default)]
+    base_url: Option<url::Url>,
+    #[serde(deserialize_with = "secret")]
+    pub api_key: String,
+}
+
+/// The protocol a provider speaks, which decides how requests are written
+/// and how their usage is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    /// OpenAI's chat completions and image generations.
+    Openai,
+    /// OpenAI's, with OpenRouter's extras: its spelling of reasoning effort,
+    /// reasoning blocks handed back, usage accounting (what each request
+    /// cost us), and prompt caching breakpoints for `anthropic/` models.
+    Openrouter,
+}
+
+impl Provider {
+    pub fn base_url(&self) -> url::Url {
+        let default = match self.api {
+            Api::Openai => "https://api.openai.com/v1",
+            Api::Openrouter => "https://openrouter.ai/api/v1",
+        };
+        self.base_url.clone().unwrap_or_else(|| url::Url::parse(default).expect("a URL"))
+    }
+}
+
+/// One way to serve a model: `provider/model`, everything after the first
+/// slash being the provider's own id, or the long form with `params`.
+#[derive(Debug)]
+pub struct Upstream {
+    pub provider: String,
+    pub model: String,
+    /// Merged into the top level of each request body sent this way.
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Upstream {
+    /// `provider/model`, as it's written in the short form.
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
+}
+
+impl<'de> Deserialize<'de> for Upstream {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Long {
+            provider: String,
+            model: String,
+            #[serde(default)]
+            params: serde_json::Map<String, serde_json::Value>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Short(String),
+            Long(Long),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Short(text) => match text.split_once('/') {
+                Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                    Ok(Upstream { provider: provider.into(), model: model.into(), params: Default::default() })
+                }
+                _ => Err(serde::de::Error::custom(format!("upstream {text:?} must be provider/model, like openrouter/anthropic/claude-sonnet-4.6"))),
+            },
+            Raw::Long(long) => Ok(Upstream { provider: long.provider, model: long.model, params: long.params }),
+        }
+    }
+}
+
+/// Request fields that `params` can't set: they're the request itself.
+const RESERVED_PARAMS: &[&str] = &["model", "messages", "prompt", "n", "stream", "stream_options"];
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
-    /// `provider/model`: everything after the first slash is the provider's
-    /// own model id, slashes and all.
-    pub upstream: String,
+    /// Tried in order, skipping any that's cooling down after failures.
+    pub upstreams: Vec<Upstream>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -185,13 +331,34 @@ pub enum Price {
     Image(ImagePrice),
 }
 
-#[derive(Debug, Deserialize)]
+/// USD per million tokens. Cached input is priced on its own: reading it
+/// back, and writing it (where providers charge extra for that). Either
+/// defaults to `input`, so a missing price never undercharges.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenPrice {
     #[serde(deserialize_with = "deserialize_decimal")]
     pub input: Decimal,
     #[serde(deserialize_with = "deserialize_decimal")]
     pub output: Decimal,
+    #[serde(default, deserialize_with = "optional_decimal")]
+    cache_read: Option<Decimal>,
+    #[serde(default, deserialize_with = "optional_decimal")]
+    cache_write: Option<Decimal>,
+}
+
+fn optional_decimal<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Decimal>, D::Error> {
+    deserialize_decimal(deserializer).map(Some)
+}
+
+/// What one completion used, in tokens. `input` is all of it, cached or not,
+/// as OpenAI counts `prompt_tokens`; `output` includes reasoning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,21 +381,34 @@ pub struct ImageSizes {
 }
 
 impl Model {
-    /// The provider's name and the model's id there.
-    pub fn upstream(&self) -> (&str, &str) {
-        self.upstream.split_once('/').unwrap_or((&self.upstream, ""))
-    }
-
     pub fn is_free_chat(&self) -> bool {
-        matches!(&self.price, Price::Tokens(p) if p.input.is_zero() && p.output.is_zero())
+        matches!(&self.price, Price::Tokens(p) if p.is_free())
     }
 }
 
 impl TokenPrice {
-    /// What `input` and `output` tokens cost.
-    pub fn cost(&self, input: u64, output: u64) -> Money {
+    pub fn cache_read(&self) -> Decimal {
+        self.cache_read.unwrap_or(self.input)
+    }
+
+    pub fn cache_write(&self) -> Decimal {
+        self.cache_write.unwrap_or(self.input)
+    }
+
+    pub fn is_free(&self) -> bool {
+        [self.input, self.output, self.cache_read(), self.cache_write()].iter().all(Decimal::is_zero)
+    }
+
+    /// What `tokens` cost. Cached input is part of `input`, so it's taken
+    /// out of what's charged at the full price.
+    pub fn cost(&self, tokens: Tokens) -> Money {
+        let uncached = tokens.input.saturating_sub(tokens.cache_read).saturating_sub(tokens.cache_write);
         let million = Decimal::from(1_000_000);
-        let dollars = self.input * Decimal::from(input) / million + self.output * Decimal::from(output) / million;
+        let dollars = [(self.input, uncached), (self.cache_read(), tokens.cache_read), (self.cache_write(), tokens.cache_write), (self.output, tokens.output)]
+            .into_iter()
+            .map(|(price, n)| price * Decimal::from(n))
+            .sum::<Decimal>()
+            / million;
         Money::from_dollars(dollars).unwrap_or(Money(i64::MAX))
     }
 }
@@ -290,21 +470,34 @@ impl Config {
         {
             bail!("payments.bitcoin.esplora must be set for a testnet key, such as https://mempool.space/testnet4/api");
         }
+        if self.routing.failures == 0 {
+            bail!("routing.failures must be at least 1");
+        }
         for (id, model) in &self.models {
-            let (provider, upstream) = model.upstream();
-            if upstream.is_empty() {
-                bail!("model {id}: upstream must be provider/model, like openrouter/anthropic/claude-sonnet-4.6");
+            if model.upstreams.is_empty() {
+                bail!("model {id}: upstreams can't be empty");
             }
-            if !self.providers.contains_key(provider) {
-                bail!("model {id}: no provider named {provider}");
+            for upstream in &model.upstreams {
+                let Some(provider) = self.providers.get(&upstream.provider) else {
+                    bail!("model {id}: no provider named {}", upstream.provider);
+                };
+                if let Some(key) = upstream.params.keys().find(|k| RESERVED_PARAMS.contains(&k.as_str())) {
+                    bail!("model {id}: params can't set {key}");
+                }
+                if matches!(model.price, Price::Image(_)) && provider.api != Api::Openai {
+                    bail!("model {id}: image models need providers with api: openai, and {} isn't one", upstream.provider);
+                }
             }
             match &model.price {
                 Price::Tokens(price) => {
                     if model.context_window.is_none() {
                         bail!("model {id}: chat models need a context_window");
                     }
-                    if price.input < Decimal::ZERO || price.output < Decimal::ZERO {
+                    if [price.input, price.output, price.cache_read(), price.cache_write()].iter().any(|p| *p < Decimal::ZERO) {
                         bail!("model {id}: prices can't be negative");
+                    }
+                    if price.cache_read() > price.input {
+                        bail!("model {id}: cache_read costs more than input, which is surely a mistake");
                     }
                 }
                 Price::Image(_) => {}
@@ -340,25 +533,46 @@ mod tests {
         }
         let config = Config::parse(EXAMPLE).unwrap();
         let sonnet = &config.models["claude-sonnet-4.6"];
-        assert_eq!(sonnet.upstream(), ("anthropic", "claude-sonnet-4-6"));
+        let labels: Vec<String> = sonnet.upstreams.iter().map(Upstream::label).collect();
+        assert_eq!(labels, ["anthropic/claude-sonnet-4-6", "openrouter/anthropic/claude-sonnet-4.6"]);
         let Price::Tokens(price) = &sonnet.price else { panic!() };
-        assert_eq!(price.cost(1_000_000, 0), Money(3_000_000_000));
-        assert_eq!(price.cost(1, 1), Money(18_000));
+        assert_eq!(price.cost(Tokens { input: 1_000_000, ..Tokens::default() }), Money(3_000_000_000));
+        assert_eq!(price.cost(Tokens { input: 1, output: 1, ..Tokens::default() }), Money(18_000));
+        // A million in: half read from the cache, a quarter written to it.
+        let cached = Tokens { input: 1_000_000, cache_read: 500_000, cache_write: 250_000, output: 0 };
+        assert_eq!(price.cost(cached), Money(750_000_000 + 150_000_000 + 937_500_000));
         assert!(matches!(config.models["gpt-image-1"].price, Price::Image(_)));
         let gemma = &config.models["gemma-4-26b"];
-        assert_eq!(gemma.upstream(), ("openrouter", "google/gemma-4-26b-a4b-it"));
+        assert_eq!(gemma.upstreams[0].label(), "openrouter/google/gemma-4-26b-a4b-it");
         assert!(gemma.is_free_chat());
+        assert_eq!(config.providers["openrouter"].base_url().as_str(), "https://openrouter.ai/api/v1");
+        assert_eq!(config.routing.first_byte_timeout, Duration::from_secs(60));
         assert_eq!(config.payments.bitcoin.unwrap().xpub.address(0).unwrap(), crate::payments::bitcoin::tests::FIRST);
     }
 
     #[test]
     fn rejects_mistakes() {
-        let base = "origin: https://ai.example.com\ndatabase: x.db\nproviders:\n  p:\n    base_url: https://p.example.com/v1\n    api_key: k\n";
+        let base = "origin: https://ai.example.com\ndatabase: x.db\nproviders:\n  p:\n    api: openai\n    base_url: https://p.example.com/v1\n    api_key: k\n  r:\n    api: openrouter\n    api_key: k\n";
         let err = |models: &str| Config::parse(&format!("{base}models:\n{models}")).unwrap_err().to_string();
-        assert!(err("  m:\n    upstream: q/x\n    context_window: 1\n    price: {input: 1, output: 1}\n").contains("no provider named q"));
-        assert!(err("  m:\n    upstream: p\n    context_window: 1\n    price: {input: 1, output: 1}\n").contains("provider/model"));
-        assert!(err("  m:\n    upstream: p/x\n    price: {input: 1, output: 1}\n").contains("context_window"));
+        let chat = "    context_window: 1\n    price: {input: 1, output: 1}\n";
+        assert!(err(&format!("  m:\n    upstreams: [q/x]\n{chat}")).contains("no provider named q"));
+        assert!(err(&format!("  m:\n    upstreams: [p]\n{chat}")).contains("provider/model"));
+        assert!(err(&format!("  m:\n    upstreams: []\n{chat}")).contains("can't be empty"));
+        assert!(err("  m:\n    upstreams: [p/x]\n    price: {input: 1, output: 1}\n").contains("context_window"));
+        assert!(err(&format!("  m:\n    upstreams: [{{provider: p, model: x, params: {{stream: false}}}}]\n{chat}")).contains("can't set stream"));
+        assert!(err("  m:\n    upstreams: [p/x]\n    context_window: 1\n    price: {input: 1, output: 1, cache_read: 2}\n").contains("cache_read"));
+        let image = "    price: {low: {square: 1, wide: 1}, medium: {square: 1, wide: 1}, high: {square: 1, wide: 1}}\n";
+        assert!(err(&format!("  m:\n    upstreams: [r/x]\n{image}")).contains("api: openai"));
         assert!(Config::parse(&format!("{base}models: {{}}\ntypo: 1\n")).is_err());
+        assert!(Config::parse(&format!("{base}models: {{}}\nrouting: {{cooldown: soon}}\n")).unwrap_err().to_string().contains("duration"));
+
+        let config = Config::parse(&format!("{base}models:\n  m:\n    upstreams: [{{provider: r, model: a/b, params: {{provider: {{order: [x]}}}}}}, p/c]\n{chat}routing: {{cooldown: 2m, connect_timeout: 5}}\n")).unwrap();
+        let m = &config.models["m"];
+        assert_eq!((m.upstreams[0].label(), m.upstreams[1].label()), ("r/a/b".into(), "p/c".into()));
+        assert_eq!(m.upstreams[0].params["provider"]["order"][0], "x");
+        assert_eq!((config.routing.cooldown, config.routing.connect_timeout), (Duration::from_secs(120), Duration::from_secs(5)));
+        let Price::Tokens(price) = &m.price else { panic!() };
+        assert_eq!((price.cache_read(), price.cache_write()), (Decimal::ONE, Decimal::ONE));
 
         let bitcoin = |section: &str| Config::parse(&format!("{base}models: {{}}\npayments:\n  bitcoin:\n{section}"));
         assert!(bitcoin("    xpub: nope\n").unwrap_err().to_string().contains("extended public key"));

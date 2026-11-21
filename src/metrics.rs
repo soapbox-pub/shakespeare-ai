@@ -20,6 +20,9 @@ struct Inner {
     prompt_tokens: BTreeMap<String, u64>,
     completion_tokens: BTreeMap<String, u64>,
     cost: BTreeMap<String, i64>,
+    /// Upstream (`provider/model`) → failures that sent a request on to
+    /// the next.
+    upstream_failures: BTreeMap<String, u64>,
 }
 
 impl Metrics {
@@ -32,6 +35,10 @@ impl Metrics {
         *inner.prompt_tokens.entry(model.into()).or_default() += prompt;
         *inner.completion_tokens.entry(model.into()).or_default() += completion;
         *inner.cost.entry(model.into()).or_default() += cost.nanos();
+    }
+
+    pub fn upstream_failure(&self, upstream: &str) {
+        *self.inner.lock().upstream_failures.entry(upstream.into()).or_default() += 1;
     }
 
     pub fn render(&self) -> String {
@@ -50,6 +57,10 @@ impl Metrics {
         let _ = writeln!(out, "# TYPE shakespeare_cost_usd_total counter");
         for (model, nanos) in &inner.cost {
             let _ = writeln!(out, "shakespeare_cost_usd_total{{model=\"{}\"}} {}", escape(model), Money(*nanos).to_f64());
+        }
+        let _ = writeln!(out, "# TYPE shakespeare_upstream_failures_total counter");
+        for (upstream, n) in &inner.upstream_failures {
+            let _ = writeln!(out, "shakespeare_upstream_failures_total{{upstream=\"{}\"}} {n}", escape(upstream));
         }
         out
     }

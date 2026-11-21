@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -170,4 +170,17 @@ CREATE INDEX api_keys_pubkey ON api_keys (pubkey, created_at DESC, id DESC);
 -- its generations' costs, which the index covers.
 ALTER TABLE generations ADD COLUMN api_key_id TEXT REFERENCES api_keys (id);
 CREATE INDEX generations_api_key ON generations (api_key_id, created_at, cost) WHERE api_key_id IS NOT NULL;
+"#;
+
+/// Which upstream served each generation and what it cost us, and the cached
+/// input it was charged for apart.
+const UPSTREAMS: &str = r#"
+-- `provider/model` as the config names it. NULL for generations from before
+-- models had more than one.
+ALTER TABLE generations ADD COLUMN upstream TEXT;
+-- What the upstream says it charged us, if it says. Never shown to clients.
+ALTER TABLE generations ADD COLUMN upstream_cost INTEGER;
+-- Of prompt_tokens, those read from and written to the provider's cache.
+ALTER TABLE generations ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE generations ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
 "#;

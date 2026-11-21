@@ -52,7 +52,11 @@ async fn fake_upstream() -> String {
         axum::Json(json!({
             "id": "up-2", "object": "chat.completion", "created": 1700000000,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000, "cost": cost},
+            "usage": {
+                "prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000, "cost": cost,
+                "prompt_tokens_details": if cost.is_null() { Value::Null } else { json!({ "cached_tokens": 600, "cache_write_tokens": 100 }) },
+                "completion_tokens_details": { "reasoning_tokens": 400 },
+            },
             "system_fingerprint": "dropped",
         }))
         .into_response()
@@ -62,7 +66,26 @@ async fn fake_upstream() -> String {
         assert_eq!(request["model"], "gpt-image-1");
         axum::Json(json!({ "created": 1, "quality": "medium", "size": "1024x1024", "data": [{"b64_json": "x"}, {"b64_json": "y"}] }))
     }
-    let app = Router::new().route("/v1/chat/completions", post(chat)).route("/v1/images/generations", post(images));
+    async fn down() -> impl IntoResponse {
+        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({ "error": { "message": "overloaded" } })))
+    }
+    async fn refuses() -> impl IntoResponse {
+        (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": { "message": "bad tool", "type": "invalid_request_error" } })))
+    }
+    async fn silent() -> impl IntoResponse {
+        let stream = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
+        });
+        ([("content-type", "text/event-stream")], Body::from_stream(stream))
+    }
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/images/generations", post(images))
+        .route("/down/v1/chat/completions", post(down))
+        .route("/down/v1/images/generations", post(down))
+        .route("/refuses/v1/chat/completions", post(refuses))
+        .route("/silent/v1/chat/completions", post(silent));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -71,33 +94,71 @@ async fn fake_upstream() -> String {
 
 async fn setup() -> (Arc<App>, TempDb) {
     let upstream = fake_upstream().await;
+    let root = upstream.trim_end_matches("/v1");
     let yaml = format!(
         r#"
 origin: https://ai.example.com
 database: unused.sqlite3
 providers:
   fake:
+    api: openai
     base_url: {upstream}
     api_key: test
   router:
+    api: openrouter
     base_url: {upstream}
     api_key: test
-    openrouter: true
+  down:
+    api: openai
+    base_url: {root}/down/v1
+    api_key: test
+  refuses:
+    api: openai
+    base_url: {root}/refuses/v1
+    api_key: test
+  silent:
+    api: openai
+    base_url: {root}/silent/v1
+    api_key: test
+routing:
+  first_byte_timeout: 300ms
+  failures: 2
+  cooldown: 1h
 models:
+  fallback:
+    hidden: true
+    upstreams: [down/upstream-model, fake/upstream-model]
+    context_window: 1000
+    price: {{ input: 3, output: 15 }}
+  slow-fallback:
+    hidden: true
+    upstreams: [silent/upstream-model, fake/upstream-model]
+    context_window: 1000
+    price: {{ input: 3, output: 15 }}
+  refused:
+    hidden: true
+    upstreams: [refuses/upstream-model, fake/upstream-model]
+    context_window: 1000
+    price: {{ input: 3, output: 15 }}
+  cached:
+    hidden: true
+    upstreams: [router/upstream-model]
+    context_window: 1000
+    price: {{ input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }}
   paid:
-    upstream: fake/upstream-model
+    upstreams: [fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
   free:
-    upstream: fake/upstream-model
+    upstreams: [fake/upstream-model]
     context_window: 1000
     price: {{ input: 0, output: 0 }}
   routed-free:
-    upstream: router/upstream-model
+    upstreams: [router/upstream-model]
     context_window: 1000
     price: {{ input: 0, output: 0 }}
   gpt-image-1:
-    upstream: fake/gpt-image-1
+    upstreams: [down/gpt-image-1, fake/gpt-image-1]
     price:
       low: {{ square: 0.011, wide: 0.016 }}
       medium: {{ square: 0.042, wide: 0.063 }}
@@ -226,6 +287,78 @@ async fn charges_a_free_model_whatever_the_provider_charged() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["usage"]["cost"], 0.5);
     assert_eq!(balance(&app), Money(-500_000_000));
+}
+
+fn upstreams_used(app: &App) -> Vec<Option<String>> {
+    app.db
+        .with(|conn| {
+            let mut stmt = conn.prepare("SELECT upstream FROM generations ORDER BY rowid")?;
+            Ok(stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+        })
+        .unwrap()
+}
+
+fn chat(model: &str, stream: bool) -> Request<Body> {
+    signed("POST", "/v1/chat/completions", Some(json!({ "model": model, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] })))
+}
+
+#[tokio::test]
+async fn falls_over_to_the_next_upstream() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let (status, body) = json_of(router(app.clone()).oneshot(chat("fallback", false)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["usage"]["cost"], 0.018);
+    assert_eq!(upstreams_used(&app), [Some("fake/upstream-model".to_string())]);
+    assert!(app.metrics.render().contains("shakespeare_upstream_failures_total{upstream=\"down/upstream-model\"} 1"));
+
+    // Failing twice in a row puts it out of turn, so the next request goes
+    // straight to the one that works.
+    let order = |app: &App| app.health.order(&app.config.models["fallback"].upstreams).iter().map(|u| u.label()).collect::<Vec<_>>();
+    assert_eq!(order(&app), ["down/upstream-model", "fake/upstream-model"]);
+    router(app.clone()).oneshot(chat("fallback", false)).await.unwrap();
+    assert_eq!(order(&app), ["fake/upstream-model", "down/upstream-model"]);
+    router(app.clone()).oneshot(chat("fallback", false)).await.unwrap();
+    assert!(app.metrics.render().contains("shakespeare_upstream_failures_total{upstream=\"down/upstream-model\"} 2"));
+}
+
+#[tokio::test]
+async fn falls_over_from_a_stream_that_never_starts() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let response = router(app.clone()).oneshot(chat("slow-fallback", true)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(text.contains("\"Hel\"") && text.ends_with("data: [DONE]\n\n"), "{text}");
+    wait_for_generations(&app, 1).await;
+    assert_eq!(upstreams_used(&app), [Some("fake/upstream-model".to_string())]);
+}
+
+#[tokio::test]
+async fn does_not_fall_over_when_the_request_is_refused() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let (status, body) = json_of(router(app.clone()).oneshot(chat("refused", false)).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["message"]), (StatusCode::BAD_REQUEST, &json!("bad tool")));
+    assert!(upstreams_used(&app).is_empty());
+}
+
+#[tokio::test]
+async fn prices_cached_input_and_records_what_it_cost_us() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let (status, body) = json_of(router(app.clone()).oneshot(chat("cached", false)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 300 uncached × $3/M + 600 read × $0.30/M + 100 written × $3.75/M +
+    // 1000 out × $15/M, whatever OpenRouter charged us.
+    assert_eq!(body["usage"]["cost"], 0.016455);
+    assert_eq!(body["usage"]["prompt_tokens_details"], json!({ "cached_tokens": 600, "cache_write_tokens": 100 }));
+    assert_eq!(body["usage"]["completion_tokens_details"], json!({ "reasoning_tokens": 400 }));
+    let row: (i64, i64, Option<i64>, String) = app
+        .db
+        .with(|conn| Ok(conn.query_row("SELECT cache_read_tokens, cache_write_tokens, upstream_cost, upstream FROM generations", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?))
+        .unwrap();
+    assert_eq!(row, (600, 100, Some(500_000_000), "router/upstream-model".into()));
 }
 
 #[tokio::test]
@@ -389,6 +522,8 @@ async fn validates_requests() {
     let ids: Vec<&str> = body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["paid", "gpt-image-1"]);
     assert_eq!(body["data"][0]["pricing"]["prompt"], "0.000003");
+    // Cached input costs what input does, when no price is given.
+    assert_eq!(body["data"][0]["pricing"]["input_cache_read"], "0.000003");
 
     let preflight = Request::builder()
         .method("OPTIONS")

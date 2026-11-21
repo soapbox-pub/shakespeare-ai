@@ -29,6 +29,7 @@ pub struct App {
     pub metrics: Metrics,
     pub limiter: RateLimiter,
     pub dashboard: crate::dashboard::Source,
+    pub health: api::upstream::Health,
     /// Inference requests each account has in flight.
     in_flight: Mutex<HashMap<String, usize>>,
     /// When each thing [`App::not_since`] was asked about last went ahead.
@@ -98,7 +99,7 @@ impl App {
     pub fn new(config: Config, db: Db) -> anyhow::Result<App> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("shakespeare-ai/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(15))
+            .connect_timeout(config.routing.connect_timeout)
             // Between bytes, not overall: a long completion streams for many
             // minutes, but an upstream silent this long is gone.
             .read_timeout(Duration::from_secs(600))
@@ -111,6 +112,7 @@ impl App {
             metrics: Metrics::default(),
             limiter: RateLimiter::default(),
             dashboard: crate::dashboard::source(),
+            health: api::upstream::Health::default(),
             in_flight: Mutex::default(),
             last_done: Mutex::default(),
             seen_auth: Mutex::default(),

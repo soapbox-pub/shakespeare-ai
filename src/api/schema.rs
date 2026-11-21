@@ -246,14 +246,7 @@ impl ChatRequest {
     /// The request for a provider, as a JSON object to add our own fields
     /// to: `model` is the provider's id, and OpenRouter gets its own spelling
     /// of reasoning effort and the reasoning blocks it sent before.
-    pub fn upstream(&mut self, model: &str, openrouter: bool) -> serde_json::Map<String, Value> {
-        if !openrouter {
-            for message in &mut self.messages {
-                if let Message::Assistant { reasoning_details, .. } = message {
-                    *reasoning_details = None;
-                }
-            }
-        }
+    pub fn upstream(&self, model: &str, openrouter: bool) -> serde_json::Map<String, Value> {
         let upstream = Upstream {
             model,
             messages: &self.messages,
@@ -273,6 +266,11 @@ impl ChatRequest {
         let Ok(Value::Object(mut out)) = serde_json::to_value(&upstream) else {
             unreachable!("a struct serializes to an object")
         };
+        if !openrouter && let Some(Value::Array(messages)) = out.get_mut("messages") {
+            for message in messages.iter_mut().filter_map(Value::as_object_mut) {
+                message.remove("reasoning_details");
+            }
+        }
         if let Some(effort) = self.reasoning_effort {
             let effort = serde_json::to_value(effort).unwrap_or(Value::Null);
             if openrouter {
@@ -300,7 +298,7 @@ mod tests {
 
     #[test]
     fn drops_everything_outside_the_schema() {
-        let mut request = parse(json!({
+        let request = parse(json!({
             "model": "m",
             "messages": [
                 { "role": "system", "content": "sys", "cache_control": { "type": "ephemeral" } },
@@ -338,6 +336,8 @@ mod tests {
         let other = request.upstream("gemma", false);
         assert_eq!(other["reasoning_effort"], "high");
         assert!(other["messages"][2].get("reasoning_details").is_none());
+        // Writing one upstream's request leaves the next's alone.
+        assert_eq!(request.upstream("google/gemma", true)["messages"][2]["reasoning_details"], json!([{ "type": "reasoning.text" }]));
     }
 
     #[test]

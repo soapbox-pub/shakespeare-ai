@@ -7,6 +7,7 @@ pub mod images;
 pub mod keys;
 pub mod models;
 pub mod schema;
+pub mod upstream;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

@@ -409,12 +409,21 @@ pub struct Generation {
     pub pubkey: String,
     pub model: String,
     pub created_at: i64,
+    /// All of the input, cached or not.
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Of `prompt_tokens`, those read from the provider's cache.
+    pub cache_read_tokens: u64,
+    /// Of `prompt_tokens`, those written to it.
+    pub cache_write_tokens: u64,
     pub cost: Money,
     pub estimated: bool,
     /// The API key it was made with, if it wasn't signed for with NIP-98.
     pub api_key_id: Option<String>,
+    /// The upstream that served it, `provider/model`.
+    pub upstream: Option<String>,
+    /// What it cost us, if the upstream said.
+    pub upstream_cost: Option<Money>,
 }
 
 pub fn new_generation_id() -> String {
@@ -425,8 +434,9 @@ pub fn new_generation_id() -> String {
 pub fn record_generation(conn: &mut Connection, g: &Generation) -> Result<()> {
     let tx = write_tx(conn)?;
     tx.execute(
-        "INSERT INTO generations (id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated, api_key_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO generations (id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+             cost, estimated, api_key_id, upstream, upstream_cost)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             g.id,
             g.upstream_id,
@@ -435,9 +445,13 @@ pub fn record_generation(conn: &mut Connection, g: &Generation) -> Result<()> {
             g.created_at,
             g.prompt_tokens as i64,
             g.completion_tokens as i64,
+            g.cache_read_tokens as i64,
+            g.cache_write_tokens as i64,
             g.cost.nanos(),
             g.estimated,
-            g.api_key_id
+            g.api_key_id,
+            g.upstream,
+            g.upstream_cost.map(Money::nanos)
         ],
     )?;
     if g.cost.is_positive() {
@@ -451,7 +465,8 @@ pub fn list_generations(conn: &Connection, pubkey: &str, limit: usize, after: Op
     let cursor = after.map(|id| cursor_of(conn, "generations", "pubkey", pubkey, id)).transpose()?.flatten();
     let (after_time, after_id) = cursor.unzip();
     let mut stmt = conn.prepare_cached(
-        "SELECT id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated, api_key_id FROM generations
+        "SELECT id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cost, estimated, api_key_id,
+             cache_read_tokens, cache_write_tokens, upstream, upstream_cost FROM generations
          WHERE pubkey = ?1 AND (?2 IS NULL OR (created_at, id) < (?2, ?3)) ORDER BY created_at DESC, id DESC LIMIT ?4",
     )?;
     let rows = stmt.query_map(params![pubkey, after_time, after_id, limit as i64 + 1], |r| {
@@ -466,6 +481,10 @@ pub fn list_generations(conn: &Connection, pubkey: &str, limit: usize, after: Op
             cost: Money(r.get(7)?),
             estimated: r.get(8)?,
             api_key_id: r.get(9)?,
+            cache_read_tokens: r.get::<_, i64>(10)? as u64,
+            cache_write_tokens: r.get::<_, i64>(11)? as u64,
+            upstream: r.get(12)?,
+            upstream_cost: r.get::<_, Option<i64>>(13)?.map(Money),
         })
     })?;
     page(rows.collect::<rusqlite::Result<Vec<_>>>()?, limit)
@@ -887,14 +906,19 @@ mod tests {
                         created_at: 100,
                         prompt_tokens: 1,
                         completion_tokens: 1,
+                        cache_read_tokens: 1,
+                        cache_write_tokens: 0,
                         cost: Money(1),
                         estimated: false,
                         api_key_id: None,
+                        upstream: Some("p/m".into()),
+                        upstream_cost: Some(Money(2)),
                     },
                 )?;
             }
             let (first, more) = list_generations(conn, ALICE, 2, None)?;
             assert!(more);
+            assert_eq!((first[0].upstream.as_deref(), first[0].upstream_cost, first[0].cache_read_tokens), (Some("p/m"), Some(Money(2)), 1));
             let (second, _) = list_generations(conn, ALICE, 2, Some(&first[1].id))?;
             let (third, more) = list_generations(conn, ALICE, 2, Some(&second[1].id))?;
             assert!(!more);

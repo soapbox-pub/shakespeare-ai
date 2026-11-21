@@ -79,21 +79,49 @@ directory, beside the binary or in the source tree, so build it first:
 
 YAML; see `config.example.yaml`, which documents every field. In short:
 
-- **providers**: OpenAI-compatible APIs, each a `base_url` and `api_key`.
-  `openrouter: true` turns on OpenRouter's usage accounting (the reported
-  per-request cost becomes the charge) and Anthropic prompt caching
-  breakpoints.
-- **models**: what clients ask for by id. `upstream: provider/model` maps one
-  to a provider, with everything after the first slash being the provider's own
-  id (`openrouter/anthropic/claude-sonnet-4.6`). A chat model has a
-  `context_window` and a `price` in USD per million tokens. An image model's
-  `price` is per image, by quality and shape. `hidden: true` keeps a model out
-  of `/v1/models` while it stays callable. Free chat models are always hidden.
+- **routing**: how hard to try a model's upstreams (see below).
+- **providers**: upstream APIs, each an `api` (the protocol: `openai`, or
+  `openrouter` for OpenAI's with OpenRouter's usage accounting and Anthropic
+  prompt caching breakpoints), an `api_key`, and a `base_url` if it isn't the
+  usual one for `api`.
+- **models**: what clients ask for by id, each with a list of `upstreams`
+  tried in order. An upstream is `provider/model`, everything after the first
+  slash being the provider's own id (`openrouter/anthropic/claude-sonnet-4.6`),
+  or `{ provider, model, params }`, whose `params` are merged into each
+  request body sent that way. A chat model has a `context_window` and a
+  `price` in USD per million tokens: `input`, `output`, and `cache_read` and
+  `cache_write` for cached input, which default to `input`. An image model's
+  `price` is per image, by quality and shape, and its upstreams must speak
+  `openai`. `hidden: true` keeps a model out of `/v1/models` while it stays
+  callable. Free chat models are always hidden.
 - **payments**: the fee (`0.1` is 10%), the minimum purchase, Stripe's keys,
   the Lightning address, and the bitcoin account key.
 
 Any secret may be `${ENV_VAR}`. Unknown fields are errors, so typos don't pass
 silently.
+
+### Upstreams
+
+A request goes to the model's first upstream, and on to the next if that one
+fails in a way another might not: it can't be reached, it's overloaded or down
+(408, 429, 5xx), it refuses our credentials or credit (401–403), or it hasn't
+got the model (404). A refusal of the request itself (any other 4xx) would be
+the same anywhere, so it goes back to the client. A stream is committed to once
+its first byte arrives, which must be within `routing.first_byte_timeout`;
+after that nothing falls over, since the client has started reading. A
+non-streaming response comes whole, however long it takes, so only streams
+have that timeout.
+
+An upstream that fails `routing.failures` times in a row goes to the back of
+the line for `routing.cooldown`. That's kept in memory, so it starts again on
+restart. Failures are counted in `shakespeare_upstream_failures_total`.
+
+A request costs the model's price whichever upstream serves it, so clients
+can know what they'll pay. Each generation records the upstream that served
+it, and what it cost us when the provider says (OpenRouter does), for an
+operator to see the margin by route; neither is shown to clients. The one
+exception is a free model an upstream charged us for anyway, which is charged
+on at that cost.
 
 ## Lightning
 
@@ -176,7 +204,8 @@ SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
 - `accounts` caches each balance, updated in the same transaction as each
   ledger entry.
 - `payments`, `giftcards` and `generations` are the records behind the
-  entries. `bitcoin_addresses` holds each bitcoin payment's address, its
+  entries. A generation keeps its tokens (with the cached input among them),
+  its cost, the upstream that served it and, if known, what that cost us. `bitcoin_addresses` holds each bitcoin payment's address, its
   derivation index and the sats it's owed.
 - `api_keys` holds each key's hash, owner, limit and state. A key's spend is
   the sum of its generations' costs, so there's no counter to drift.

@@ -1,5 +1,5 @@
-//! `/v1/chat/completions`: proxied to the model's provider, and charged for
-//! by the usage it reports.
+//! `/v1/chat/completions`: proxied to the first of the model's upstreams that
+//! answers, and charged at the model's price for the usage it reports.
 
 use std::sync::Arc;
 
@@ -8,14 +8,16 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
 use super::schema::ChatRequest;
+use super::upstream::{self, upstream_failure, Failure};
 use super::ApiError;
 use crate::app::App;
-use crate::config::{Price, Provider, TokenPrice};
+use crate::config::{Api, Price, Provider, TokenPrice, Tokens, Upstream};
 use crate::money::{decimal_from_json_number, Money};
 use crate::store::{self, Generation};
 
@@ -25,7 +27,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     if !raw.get("model").is_some_and(Value::is_string) {
         return Err(ApiError::invalid("missing_required_parameter", "Missing `model` property").param("model"));
     }
-    let mut request: ChatRequest = serde_json::from_value(Value::Object(raw)).map_err(|error| ApiError::invalid("invalid_parameter", format!("Invalid request: {error}")))?;
+    let request: ChatRequest = serde_json::from_value(Value::Object(raw)).map_err(|error| ApiError::invalid("invalid_parameter", format!("Invalid request: {error}")))?;
     let model_id = request.model.clone();
     let not_found = || ApiError::invalid("model_not_found", format!("Model '{model_id}' is not supported")).param("model");
     let model = app.config.models.get(&model_id).ok_or_else(not_found)?;
@@ -33,8 +35,6 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         return Err(ApiError::invalid("invalid_model_type", format!("Model '{model_id}' cannot be used with the chat completions endpoint"))
             .param("model"));
     };
-    let (provider_name, upstream_model) = model.upstream();
-    let provider = app.config.providers.get(provider_name).ok_or_else(not_found)?;
     let free = model.is_free_chat();
     let slot = app.take_slot(&caller.pubkey)?;
 
@@ -55,92 +55,101 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     }
 
     let stream = request.is_stream();
-    let mut request = request.upstream(upstream_model, provider.openrouter);
-    if provider.openrouter {
-        // https://openrouter.ai/docs/use-cases/usage-accounting
-        request.insert("usage".into(), json!({ "include": true }));
-        if upstream_model.starts_with("anthropic/") {
-            add_cache_breakpoints(&mut request);
+    let first_byte_timeout = app.config.routing.first_byte_timeout;
+    let (attempt, upstream) = upstream::route(&app, &model_id, &model.upstreams, |upstream, provider| {
+        let body = upstream_body(&request, upstream, provider);
+        let app = &app;
+        async move {
+            let label = upstream.label();
+            let prompt_bytes = body.len();
+            let response = upstream::post(app, provider, &label, "chat/completions", body).await?;
+            if !stream {
+                return Ok(Attempt { reply: Reply::Whole(response), prompt_bytes });
+            }
+            // A stream is committed to once its first byte arrives; until
+            // then, another upstream can still have the request.
+            let mut events = response.bytes_stream().boxed();
+            match tokio::time::timeout(first_byte_timeout, events.next()).await {
+                Ok(Some(Ok(first))) => {
+                    let events = futures_util::stream::once(std::future::ready(Ok(first))).chain(events).boxed();
+                    Ok(Attempt { reply: Reply::Stream(events), prompt_bytes })
+                }
+                Ok(Some(Err(error))) => Err(Failure::Retry(upstream_failure(&format!("{label}: {error}")))),
+                Ok(None) => Err(Failure::Retry(upstream_failure(&format!("{label}: the stream ended before it began")))),
+                Err(_) => Err(Failure::Retry(upstream_failure(&format!("{label}: nothing streamed in {first_byte_timeout:?}")))),
+            }
         }
-    }
+    })
+    .await?;
 
-    let upstream_body = serde_json::to_vec(&request).map_err(anyhow::Error::from)?;
-    let response = send(&app, provider, "chat/completions", upstream_body.clone()).await?;
-
+    let openrouter = app.config.providers.get(&upstream.provider).is_some_and(|p| p.api == Api::Openrouter);
     let meter = Meter {
         app: app.clone(),
         api_key_id: caller.api_key_id(),
         pubkey: caller.pubkey,
         model_id,
-        upstream_model: upstream_model.to_string(),
-        price: TokenPrice { input: price.input, output: price.output },
+        upstream: upstream.label(),
+        upstream_model: upstream.model.clone(),
+        price: price.clone(),
         free,
-        use_reported_cost: provider.openrouter,
-        prompt_bytes: upstream_body.len(),
+        openrouter,
+        prompt_bytes: attempt.prompt_bytes,
         _slot: slot,
     };
 
-    if stream {
-        Ok(stream_response(meter, response))
-    } else {
-        let mut completion: Value = response.json().await.map_err(|e| upstream_failure(&e.to_string()))?;
-        let usage = completion.get("usage").cloned().unwrap_or(Value::Null);
-        let content_bytes = completion.pointer("/choices/0/message").map_or(0, |m| m.to_string().len());
-        let upstream_id = completion.get("id").and_then(Value::as_str).map(str::to_string);
-        meter.check_model(completion.get("model"));
-        let charge = meter.charge(&usage, content_bytes);
-        meter.record(upstream_id, &charge, false).await;
+    match attempt.reply {
+        Reply::Stream(events) => Ok(stream_response(meter, events)),
+        Reply::Whole(response) => {
+            let mut completion: Value = response.json().await.map_err(|e| upstream_failure(&e.to_string()))?;
+            let usage = completion.get("usage").cloned().unwrap_or(Value::Null);
+            let content_bytes = completion.pointer("/choices/0/message").map_or(0, |m| m.to_string().len());
+            let upstream_id = completion.get("id").and_then(Value::as_str).map(str::to_string);
+            meter.check_model(completion.get("model"));
+            let charge = meter.charge(&usage, content_bytes);
+            meter.record(upstream_id, &charge, false).await;
 
-        let body = json!({
-            "id": completion.get("id"),
-            "object": completion.get("object"),
-            "choices": completion.get_mut("choices").map(Value::take),
-            "created": completion.get("created"),
-            "model": meter.model_id,
-            "usage": charge.usage_json(),
-        });
-        Ok(Json(body).into_response())
-    }
-}
-
-/// POST to a provider, turning its refusals into errors of our own. Nothing
-/// of the client's request goes with it but the body we wrote.
-pub async fn send(app: &App, provider: &Provider, path: &str, body: Vec<u8>) -> Result<reqwest::Response, ApiError> {
-    let url = format!("{}/{path}", provider.base_url.as_str().trim_end_matches('/'));
-    let request = app.http.post(url).bearer_auth(&provider.api_key).header(header::CONTENT_TYPE, "application/json").body(body);
-    let response = request.send().await.map_err(|e| upstream_failure(&e.to_string()))?;
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    crate::log::warn("upstream.error", json!({ "status": status.as_u16(), "body": text.chars().take(2000).collect::<String>() }));
-    Err(upstream_error(status, &text))
-}
-
-/// A provider's error, as the client should see it. Its message is passed on
-/// (it usually says what's wrong with the request), but a refusal of our own
-/// credentials isn't the client's problem, and a provider's rate limit mustn't
-/// look like the client running out of credit.
-fn upstream_error(status: StatusCode, body: &str) -> ApiError {
-    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    let error = parsed.get("error").unwrap_or(&parsed);
-    let message = error.get("message").and_then(Value::as_str).filter(|m| !m.is_empty()).unwrap_or("The upstream provider returned an error");
-    match status.as_u16() {
-        401 | 403 => upstream_failure("the upstream provider refused our credentials"),
-        429 => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "api_error", "upstream_rate_limited", "The upstream provider is busy. Try again shortly."),
-        _ => {
-            let kind = error.get("type").and_then(Value::as_str).unwrap_or("api_error");
-            let code = error.get("code").and_then(|c| c.as_str().map(str::to_string).or_else(|| c.as_i64().map(|n| n.to_string())));
-            let status = if status.is_server_error() { StatusCode::BAD_GATEWAY } else { status };
-            ApiError::new(status, kind, code.as_deref().unwrap_or("upstream_error"), message)
+            let body = json!({
+                "id": completion.get("id"),
+                "object": completion.get("object"),
+                "choices": completion.get_mut("choices").map(Value::take),
+                "created": completion.get("created"),
+                "model": meter.model_id,
+                "usage": charge.usage_json(),
+            });
+            Ok(Json(body).into_response())
         }
     }
 }
 
-pub fn upstream_failure(detail: &str) -> ApiError {
-    crate::log::warn("upstream.failure", json!({ "detail": detail }));
-    ApiError::new(StatusCode::BAD_GATEWAY, "api_error", "upstream_error", "The upstream provider could not be reached. Try again shortly.")
+/// An upstream that answered, and how.
+struct Attempt {
+    reply: Reply,
+    /// The size of the request it was sent, for an estimate.
+    prompt_bytes: usize,
+}
+
+enum Reply {
+    Whole(reqwest::Response),
+    /// Its events, the first already arrived.
+    Stream(BoxStream<'static, reqwest::Result<Bytes>>),
+}
+
+/// The request body for one upstream: the client's request in that
+/// provider's dialect, with the upstream's own `params` over it.
+fn upstream_body(request: &ChatRequest, upstream: &Upstream, provider: &Provider) -> Vec<u8> {
+    let openrouter = provider.api == Api::Openrouter;
+    let mut body = request.upstream(&upstream.model, openrouter);
+    if openrouter {
+        // https://openrouter.ai/docs/use-cases/usage-accounting
+        body.insert("usage".into(), json!({ "include": true }));
+        if upstream.model.starts_with("anthropic/") {
+            add_cache_breakpoints(&mut body);
+        }
+    }
+    for (key, value) in &upstream.params {
+        body.insert(key.clone(), value.clone());
+    }
+    serde_json::to_vec(&body).unwrap_or_default()
 }
 
 /// Mark Anthropic prompt cache breakpoints, through OpenRouter. Anthropic
@@ -185,33 +194,42 @@ struct Meter {
     pubkey: String,
     api_key_id: Option<String>,
     model_id: String,
+    /// The upstream that served it, `provider/model`.
+    upstream: String,
     /// The provider's id for it, to notice a provider answering with another.
     upstream_model: String,
     price: TokenPrice,
     free: bool,
-    /// OpenRouter reports what each request actually cost (cache discounts
-    /// and all); with it, that's the charge rather than the list price.
-    use_reported_cost: bool,
+    /// OpenRouter reports what each request cost us.
+    openrouter: bool,
     prompt_bytes: usize,
     /// Held until the generation is charged, however it ends.
     _slot: crate::app::Slot,
 }
 
 struct Charge {
-    prompt_tokens: u64,
-    completion_tokens: u64,
+    tokens: Tokens,
+    /// Of the output, if the provider said.
+    reasoning_tokens: Option<u64>,
     cost: Money,
+    /// What it cost us, if the provider said.
+    upstream_cost: Option<Money>,
     estimated: bool,
 }
 
 impl Charge {
     fn usage_json(&self) -> Value {
-        json!({
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.prompt_tokens + self.completion_tokens,
-            "cost": self.cost.to_f64(),
-        })
+        let t = self.tokens;
+        let mut usage = Map::new();
+        usage.insert("prompt_tokens".into(), t.input.into());
+        usage.insert("completion_tokens".into(), t.output.into());
+        usage.insert("total_tokens".into(), (t.input + t.output).into());
+        usage.insert("prompt_tokens_details".into(), json!({ "cached_tokens": t.cache_read, "cache_write_tokens": t.cache_write }));
+        if let Some(reasoning) = self.reasoning_tokens {
+            usage.insert("completion_tokens_details".into(), json!({ "reasoning_tokens": reasoning }));
+        }
+        usage.insert("cost".into(), self.cost.to_f64().into());
+        Value::Object(usage)
     }
 }
 
@@ -221,40 +239,52 @@ fn estimate_tokens(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(4)
 }
 
+/// The tokens an OpenAI-style `usage` reports, cached input included as
+/// OpenRouter reports it, if it reports any.
+fn reported_tokens(usage: &Value) -> Option<Tokens> {
+    let count = |pointer: &str| usage.pointer(pointer).and_then(Value::as_u64);
+    Some(Tokens {
+        input: count("/prompt_tokens")?,
+        output: count("/completion_tokens")?,
+        cache_read: count("/prompt_tokens_details/cached_tokens").unwrap_or(0),
+        cache_write: count("/prompt_tokens_details/cache_write_tokens").unwrap_or(0),
+    })
+}
+
 impl Meter {
     /// The charge for a reported `usage`, or an estimate from the bytes sent
-    /// and received if there's none.
+    /// and received if there's none. It's the model's price, whichever
+    /// upstream served it.
     fn charge(&self, usage: &Value, completion_bytes: usize) -> Charge {
-        let tokens = |name: &str| usage.get(name).and_then(Value::as_u64);
-        let (prompt_tokens, completion_tokens, estimated) = match (tokens("prompt_tokens"), tokens("completion_tokens")) {
-            (Some(p), Some(c)) => (p, c, false),
-            _ => (estimate_tokens(self.prompt_bytes), estimate_tokens(completion_bytes), true),
+        let (tokens, estimated) = match reported_tokens(usage) {
+            Some(tokens) => (tokens, false),
+            None => (Tokens { input: estimate_tokens(self.prompt_bytes), output: estimate_tokens(completion_bytes), ..Tokens::default() }, true),
         };
-        let reported = usage
+        let upstream_cost = usage
             .get("cost")
-            .filter(|_| self.use_reported_cost && !estimated)
+            .filter(|_| self.openrouter && !estimated)
             .and_then(decimal_from_json_number)
             .and_then(Money::from_dollars)
             .filter(|c| c.nanos() >= 0);
-        let cost = match reported {
+        let cost = match upstream_cost {
             // A free model the provider charged us for anyway (another model
             // answered, somehow) is charged on: it was never free.
             Some(cost) if self.free && cost.is_positive() => {
-                crate::log::warn("chat.free_model_charged", json!({ "model": self.model_id, "pubkey": self.pubkey, "cost": cost.to_f64() }));
+                crate::log::warn("chat.free_model_charged", json!({ "model": self.model_id, "upstream": self.upstream, "pubkey": self.pubkey, "cost": cost.to_f64() }));
                 cost
             }
             _ if self.free => Money::ZERO,
-            Some(cost) => cost,
-            None => self.price.cost(prompt_tokens, completion_tokens),
+            _ => self.price.cost(tokens),
         };
-        Charge { prompt_tokens, completion_tokens, cost, estimated }
+        let reasoning_tokens = usage.pointer("/completion_tokens_details/reasoning_tokens").and_then(Value::as_u64).filter(|_| !estimated);
+        Charge { tokens, reasoning_tokens, cost, upstream_cost, estimated }
     }
 
     /// Log OpenRouter answering with a model other than the one asked for,
     /// which only its routing options could make it do. (Other providers
     /// may answer with a dated id for an alias.)
     fn check_model(&self, model: Option<&Value>) {
-        if self.use_reported_cost
+        if self.openrouter
             && let Some(model) = model.and_then(Value::as_str)
             && !model.is_empty()
             && model != self.upstream_model
@@ -264,6 +294,7 @@ impl Meter {
     }
 
     async fn record(&self, upstream_id: Option<String>, charge: &Charge, stream: bool) {
+        let t = charge.tokens;
         let generation = Generation {
             id: store::new_generation_id(),
             upstream_id: upstream_id.clone(),
@@ -271,21 +302,29 @@ impl Meter {
             model: self.model_id.clone(),
             // Our clock, not the provider's: it orders the history.
             created_at: crate::util::now(),
-            prompt_tokens: charge.prompt_tokens,
-            completion_tokens: charge.completion_tokens,
+            prompt_tokens: t.input,
+            completion_tokens: t.output,
+            cache_read_tokens: t.cache_read,
+            cache_write_tokens: t.cache_write,
             cost: charge.cost,
             estimated: charge.estimated,
             api_key_id: self.api_key_id.clone(),
+            upstream: Some(self.upstream.clone()),
+            upstream_cost: charge.upstream_cost,
         };
-        self.app.metrics.usage(&self.model_id, charge.prompt_tokens, charge.completion_tokens, charge.cost);
+        self.app.metrics.usage(&self.model_id, t.input, t.output, charge.cost);
         let fields = json!({
             "pubkey": self.pubkey,
             "api_key": self.api_key_id,
             "model": self.model_id,
+            "upstream": self.upstream,
             "stream": stream,
             "cost": charge.cost.to_f64(),
-            "prompt_tokens": charge.prompt_tokens,
-            "completion_tokens": charge.completion_tokens,
+            "upstream_cost": charge.upstream_cost.map(Money::to_f64),
+            "prompt_tokens": t.input,
+            "completion_tokens": t.output,
+            "cache_read_tokens": t.cache_read,
+            "cache_write_tokens": t.cache_write,
             "estimated": charge.estimated,
             "id": upstream_id,
         });
@@ -305,10 +344,9 @@ impl Meter {
 /// The relaying runs in a task of its own, so that if the client goes away
 /// the generation is still charged for: by its reported usage if that has
 /// arrived, or else by an estimate of what was sent and received.
-fn stream_response(meter: Meter, upstream: reqwest::Response) -> Response {
+fn stream_response(meter: Meter, mut events: BoxStream<'static, reqwest::Result<Bytes>>) -> Response {
     let (tx, mut rx) = mpsc::channel::<Bytes>(64);
     tokio::spawn(async move {
-        let mut events = upstream.bytes_stream();
         let mut parser = SseParser::default();
         let mut state = StreamState::default();
         let mut client_gone = false;
@@ -462,14 +500,5 @@ mod tests {
         assert_eq!(messages[3]["content"][1]["cache_control"]["type"], "ephemeral");
         assert!(request["tools"][0].get("cache_control").is_none());
         assert_eq!(request["tools"][1]["cache_control"]["type"], "ephemeral");
-    }
-
-    #[test]
-    fn maps_upstream_errors() {
-        let e = upstream_error(StatusCode::BAD_REQUEST, r#"{"error":{"message":"bad tool","type":"invalid_request_error"}}"#);
-        assert_eq!((e.status, e.body["message"].as_str()), (StatusCode::BAD_REQUEST, Some("bad tool")));
-        assert_eq!(upstream_error(StatusCode::TOO_MANY_REQUESTS, "").status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(upstream_error(StatusCode::UNAUTHORIZED, "").status, StatusCode::BAD_GATEWAY);
-        assert_eq!(upstream_error(StatusCode::INTERNAL_SERVER_ERROR, "oops").status, StatusCode::BAD_GATEWAY);
     }
 }

@@ -163,9 +163,20 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
   "usage": {
     "prompt_tokens": 10,
     "completion_tokens": 20,
-    "total_tokens": 30
+    "total_tokens": 30,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0
+    },
+    "cost": 0.00033
   }
 }`}</Code>
+            <p>
+              <code>usage.cost</code> is what the request was charged, in credits. Of <code>prompt_tokens</code>, those
+              read from or written to the provider's prompt cache are in <code>prompt_tokens_details</code>, and are charged
+              at the model's <code>input_cache_read</code> and <code>input_cache_write</code> prices from{' '}
+              <code>/v1/models</code>. A request costs the same whichever provider serves it.
+            </p>
           </DocSection>
 
           <DocSection id="credit-management" title="Credit Management">
