@@ -45,7 +45,7 @@ impl Rates {
 async fn fetch(http: &reqwest::Client) -> Result<Decimal> {
     let coinbase = async {
         let json: serde_json::Value =
-            http.get("https://api.coinbase.com/v2/exchange-rates?currency=BTC").send().await?.error_for_status()?.json().await?;
+            http.get("https://api.coinbase.com/v2/exchange-rates?currency=BTC").timeout(super::TIMEOUT).send().await?.error_for_status()?.json().await?;
         json.pointer("/data/rates/USD").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).ok_or(anyhow!("no USD rate from Coinbase"))
     };
     let error = match coinbase.await {
@@ -56,6 +56,7 @@ async fn fetch(http: &reqwest::Client) -> Result<Decimal> {
     let coingecko = async {
         let json: serde_json::Value = http
             .get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+            .timeout(super::TIMEOUT)
             .send()
             .await?
             .error_for_status()?

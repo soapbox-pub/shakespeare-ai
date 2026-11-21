@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use futures_util::StreamExt;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
@@ -19,6 +20,15 @@ use crate::store::{self, Method, NewPayment, Payment};
 /// How long a payment stays payable. Stripe allows a Checkout session at most
 /// a day.
 const PAYMENT_LIFETIME: i64 = 24 * 60 * 60;
+
+/// The most any request to a payment provider, Esplora or an exchange rate
+/// API may take, start to finish. The client's own timeout is between bytes,
+/// and long, for streaming completions; a poll stuck that long would hold up
+/// every other payment's.
+pub const TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many payments are checked on at once.
+const CONCURRENT_CHECKS: usize = 8;
 
 /// How long after a bitcoin payment expires we keep watching its address: for
 /// a payment sent late, or one sent in time that's slow to confirm.
@@ -185,11 +195,13 @@ pub async fn check_bitcoin_payments(app: &App) -> Result<()> {
         return Ok(());
     }
     let tip = bitcoin::tip_height(&app.http, &config.esplora()).await.context("couldn't get the block height")?;
-    for (payment, sats) in watching {
-        if let Err(error) = check_bitcoin(app, config, &payment, sats, tip).await {
-            crate::log::warn("payments.bitcoin", serde_json::json!({ "id": payment.id, "error": format!("{error:#}") }));
-        }
-    }
+    futures_util::stream::iter(watching)
+        .for_each_concurrent(CONCURRENT_CHECKS, |(payment, sats)| async move {
+            if let Err(error) = check_bitcoin(app, config, &payment, sats, tip).await {
+                crate::log::warn("payments.bitcoin", serde_json::json!({ "id": payment.id, "error": format!("{error:#}") }));
+            }
+        })
+        .await;
     Ok(())
 }
 
@@ -209,11 +221,16 @@ pub async fn poll(app: Arc<App>) {
                 continue;
             }
         };
-        for payment in pending {
-            if let Err(error) = check_lightning(&app, &payment).await {
-                crate::log::warn("payments.lightning", serde_json::json!({ "id": payment.id, "error": format!("{error:#}") }));
-            }
-        }
+        futures_util::stream::iter(pending)
+            .for_each_concurrent(CONCURRENT_CHECKS, |payment| {
+                let app = &app;
+                async move {
+                    if let Err(error) = check_lightning(app, &payment).await {
+                        crate::log::warn("payments.lightning", serde_json::json!({ "id": payment.id, "error": format!("{error:#}") }));
+                    }
+                }
+            })
+            .await;
         if let Err(error) = check_bitcoin_payments(&app).await {
             crate::log::warn("payments.bitcoin", serde_json::json!({ "error": format!("{error:#}") }));
         }

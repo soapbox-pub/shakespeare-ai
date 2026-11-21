@@ -188,6 +188,11 @@ pub fn list_payments(
     page(rows.collect::<rusqlite::Result<Vec<_>>>()?, limit)
 }
 
+/// How many payments an account has started since `since`.
+pub fn payments_started(conn: &Connection, pubkey: &str, since: i64) -> Result<u32> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM payments WHERE pubkey = ? AND created_at >= ?", params![pubkey, since], |r| r.get(0))?)
+}
+
 /// Complete a payment and credit its buyer, if it hasn't been already.
 /// Whether this call did it.
 ///

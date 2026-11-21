@@ -471,6 +471,22 @@ async fn sells_credits_for_onchain_bitcoin() {
     assert_eq!(list["data"][0]["description"], "Credit purchase via Bitcoin");
 }
 
+#[tokio::test]
+async fn limits_the_payments_an_account_starts() {
+    use crate::payments::bitcoin::tests::{FakeEsplora, ZPUB};
+    let base = FakeEsplora::default().serve().await;
+    let yaml = format!("origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  bitcoin:\n    xpub: {ZPUB}\n    esplora: {base}\nproviders: {{}}\nmodels: {{}}\n");
+    let t = temp_db();
+    let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
+    app.rates.set(rust_decimal::Decimal::from(100_000));
+    let add = || signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "bitcoin" })));
+    for _ in 0..10 {
+        assert_eq!(router(app.clone()).oneshot(add()).await.unwrap().status(), StatusCode::OK);
+    }
+    let (status, body) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_payments")));
+}
+
 fn with_key(method: &str, path: &str, key: &str, body: Option<Value>) -> Request<Body> {
     Request::builder()
         .method(method)

@@ -54,6 +54,7 @@ pub async fn create_checkout(http: &reqwest::Client, secret_key: &str, r: &Check
         .header("Stripe-Version", API_VERSION)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(form)
+        .timeout(super::TIMEOUT)
         .send()
         .await?;
     let status = response.status();

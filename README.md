@@ -21,8 +21,8 @@ shakespeare-ai --config config.yaml serve
 `--config` defaults to `$SHAKESPEARE_AI_CONFIG`, then `./config.yaml`. The
 database is one SQLite file, created and migrated on start.
 
-Put it behind a reverse proxy that sets `X-Real-IP` (the gift card endpoints
-rate-limit by it) and doesn't buffer `text/event-stream` responses.
+Put it behind a reverse proxy that sets `X-Real-IP` (the gift card and
+payment endpoints rate-limit by it) and doesn't buffer `text/event-stream` responses.
 
 Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
 `checkout.session.completed`.
@@ -34,6 +34,11 @@ Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
   mint gift cards paid for by nobody, and write a CSV of codes and redemption
   links.
 - `import-legacy DIR`: import the old service's database (see below).
+
+An account may start 10 payments an hour, and an IP 30, since each is a
+Stripe session, an invoice, or a bitcoin address watched for a week. Pending
+payments are checked on 8 at a time, and a provider that takes more than 15
+seconds to answer is given up on until the next poll.
 
 ## Dashboard
 

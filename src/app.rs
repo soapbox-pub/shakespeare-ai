@@ -30,6 +30,8 @@ pub struct App {
     pub dashboard: crate::dashboard::Source,
     /// Inference requests each account has in flight.
     in_flight: Mutex<HashMap<String, usize>>,
+    /// When each thing [`App::not_since`] was asked about last went ahead.
+    last_done: Mutex<HashMap<String, Instant>>,
 }
 
 /// How many inference requests one account may have running at once.
@@ -77,7 +79,24 @@ impl App {
             limiter: RateLimiter::default(),
             dashboard: crate::dashboard::source(),
             in_flight: Mutex::default(),
+            last_done: Mutex::default(),
         })
+    }
+
+    /// Whether `key` hasn't been done in the last `every`, noting that it's
+    /// being done now if so: for work a client can ask for as often as it
+    /// likes, such as checking on a payment with its provider.
+    pub fn not_since(&self, key: &str, every: Duration) -> bool {
+        let now = Instant::now();
+        let mut last = self.last_done.lock();
+        if last.len() > 10_000 {
+            last.retain(|_, at| now.duration_since(*at) < every);
+        }
+        if last.get(key).is_some_and(|at| now.duration_since(*at) < every) {
+            return false;
+        }
+        last.insert(key.to_string(), now);
+        true
     }
 
     /// A place for one more inference request from `pubkey`, if it has one.

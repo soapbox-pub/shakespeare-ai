@@ -47,7 +47,7 @@ pub async fn request_invoice(http: &reqwest::Client, address: &str, msats: u64, 
 /// Ask an LNURL-pay endpoint for an invoice of `msats`.
 async fn request_invoice_from(http: &reqwest::Client, url: url::Url, msats: u64, comment: &str) -> Result<Invoice> {
     let pay: PayRequest =
-        http.get(url).send().await?.error_for_status()?.json().await.context("the Lightning address didn't return LNURL-pay metadata")?;
+        http.get(url).timeout(super::TIMEOUT).send().await?.error_for_status()?.json().await.context("the Lightning address didn't return LNURL-pay metadata")?;
     if msats < pay.min_sendable || msats > pay.max_sendable {
         bail!("the Lightning address accepts {} to {} sats; this invoice would be {}", pay.min_sendable / 1000, pay.max_sendable / 1000, msats / 1000);
     }
@@ -60,7 +60,7 @@ async fn request_invoice_from(http: &reqwest::Client, url: url::Url, msats: u64,
         callback.query_pairs_mut().append_pair("comment", &comment);
     }
 
-    let invoice: InvoiceResponse = http.get(callback).send().await?.json().await.context("the LNURL-pay callback didn't return an invoice")?;
+    let invoice: InvoiceResponse = http.get(callback).timeout(super::TIMEOUT).send().await?.json().await.context("the LNURL-pay callback didn't return an invoice")?;
     let Some(bolt11) = invoice.pr.filter(|pr| !pr.is_empty()) else {
         bail!("no invoice: {}", invoice.reason.unwrap_or_else(|| "no reason given".into()));
     };
@@ -73,7 +73,7 @@ async fn request_invoice_from(http: &reqwest::Client, url: url::Url, msats: u64,
 
 /// Whether the invoice behind a LUD-21 verify URL has been paid.
 pub async fn is_settled(http: &reqwest::Client, verify: &str) -> Result<bool> {
-    let response: VerifyResponse = http.get(verify).send().await?.error_for_status()?.json().await?;
+    let response: VerifyResponse = http.get(verify).timeout(super::TIMEOUT).send().await?.error_for_status()?.json().await?;
     if response.status.as_deref() == Some("ERROR") {
         bail!("verify failed: {}", response.reason.unwrap_or_default());
     }

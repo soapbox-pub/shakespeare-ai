@@ -119,7 +119,7 @@ fn endpoint(esplora: &url::Url, path: &str) -> String {
 
 /// The height of the best block.
 pub async fn tip_height(http: &reqwest::Client, esplora: &url::Url) -> Result<u64> {
-    let text = http.get(endpoint(esplora, "blocks/tip/height")).send().await?.error_for_status()?.text().await?;
+    let text = http.get(endpoint(esplora, "blocks/tip/height")).timeout(super::TIMEOUT).send().await?.error_for_status()?.text().await?;
     text.trim().parse().context("Esplora's tip height isn't a number")
 }
 
@@ -129,7 +129,7 @@ pub async fn tip_height(http: &reqwest::Client, esplora: &url::Url) -> Result<u6
 /// Esplora lists the mempool and the 25 newest confirmed transactions; a
 /// payment address sees one or two.
 pub async fn received(http: &reqwest::Client, esplora: &url::Url, address: &str, tip: u64, confirmations: u32) -> Result<Received> {
-    let txs: Vec<Tx> = http.get(endpoint(esplora, &format!("address/{address}/txs"))).send().await?.error_for_status()?.json().await?;
+    let txs: Vec<Tx> = http.get(endpoint(esplora, &format!("address/{address}/txs"))).timeout(super::TIMEOUT).send().await?.error_for_status()?.json().await?;
     let mut received = Received::default();
     for tx in txs {
         let value: u64 = tx.vout.iter().filter(|o| o.scriptpubkey_address.as_deref() == Some(address)).map(|o| o.value).sum();

@@ -40,8 +40,25 @@ pub async fn methods(State(app): State<Arc<App>>) -> Json<Value> {
     Json(body)
 }
 
+/// Payments one account, or one IP, may start in an hour. Each is a Stripe
+/// session, an invoice, or a bitcoin address that's watched for a week, so
+/// they mustn't be free to make by the thousand.
+const PAYMENTS_PER_ACCOUNT: u32 = 10;
+const PAYMENTS_PER_IP: u32 = 30;
+
 pub async fn add(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+    app.limiter.check("payments", &headers, PAYMENTS_PER_IP)?;
     let pubkey = app.authenticate(&method, &uri, &headers, &body)?;
+    let who = pubkey.clone();
+    let started = app.db.call(move |conn| store::payments_started(conn, &who, crate::util::now() - 3600)).await?;
+    if started >= PAYMENTS_PER_ACCOUNT {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "too_many_payments",
+            format!("You've started {started} payments in the last hour. Pay one of them, or try again later."),
+        ));
+    }
     let request = super::json_object(&body)?;
     let minimum = app.config.payments.minimum();
     let too_small = || {
@@ -109,8 +126,8 @@ pub async fn get_payment(State(app): State<Arc<App>>, Path(id): Path<String>, me
     let payment = lookup(&app, id.clone()).await?.filter(|p| p.pubkey == pubkey).ok_or_else(not_found)?;
 
     // Asking about a pending Lightning payment checks on it now, rather than
-    // waiting for the next poll.
-    if payment.status == "pending" && payment.method == PaymentMethod::Lightning {
+    // waiting for the next poll; but not more than every few seconds.
+    if payment.status == "pending" && payment.method == PaymentMethod::Lightning && app.not_since(&payment.id, std::time::Duration::from_secs(5)) {
         if let Err(error) = crate::payments::check_lightning(&app, &payment).await {
             crate::log::warn("payments.lightning", json!({ "id": payment.id, "error": format!("{error:#}") }));
         }
