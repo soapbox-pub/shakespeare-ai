@@ -260,6 +260,7 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(app.clone(), observe))
         .layer(middleware::from_fn(cors))
+        .layer(middleware::from_fn(security_headers))
         .with_state(app)
 }
 
@@ -323,6 +324,20 @@ impl App {
         }
         ip.or(peer)
     }
+}
+
+/// Headers no response should be without. The dashboard can sign requests
+/// without asking (a key logged in with its nsec does), so it mustn't be
+/// framed by another site and clicked through; and nothing should be read as
+/// anything but its declared type. (The dashboard's CSP, in a meta tag,
+/// can't say `frame-ancestors`.)
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
 }
 
 /// Find the client's IP, log each request and its response, and count

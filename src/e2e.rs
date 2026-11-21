@@ -400,6 +400,8 @@ async fn validates_requests() {
         .unwrap();
     let response = router(app.clone()).oneshot(preflight).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["content-security-policy"], "frame-ancestors 'none'");
     assert_eq!(response.headers()["access-control-allow-headers"], "authorization,content-type");
 }
 
