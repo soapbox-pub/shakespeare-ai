@@ -1,5 +1,5 @@
 import { useSeoMeta } from '@unhead/react';
-import { ArrowRight, BookOpen, Bitcoin, ImageIcon, KeyRound, MessageSquare, Plug } from 'lucide-react';
+import { ArrowRight, BookOpen, ImageIcon, KeyRound, MessageSquare, Plug, Wallet } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 import { LoginArea } from '@/components/auth/LoginArea';
@@ -10,25 +10,43 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
-import { useModels } from '@/hooks/useCredits';
-import type { Model } from '@/lib/api';
+import { useModels, usePaymentMethods } from '@/hooks/useCredits';
+import type { Model, PaymentMethod } from '@/lib/api';
 import { perMillion, price } from '@/lib/format';
 
-const FEATURES = [
-  { icon: Plug, title: 'OpenAI-compatible', text: 'Point any client or SDK at the endpoint. Nothing else to change.' },
-  { icon: KeyRound, title: 'Your Nostr key', text: 'Sign in and sign requests with it. No email, no password.' },
-  { icon: Bitcoin, title: 'Pay as you go', text: 'Add credits by card, Lightning or bitcoin. No subscription.' },
-];
+const METHOD_NAMES: Record<PaymentMethod, string> = { stripe: 'card', lightning: 'Lightning', bitcoin: 'bitcoin' };
+
+/** "card, Lightning or bitcoin", for the methods this server takes. */
+function methodList(methods: PaymentMethod[]): string {
+  const names = methods.map((m) => METHOD_NAMES[m]).filter(Boolean);
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : (names[0] ?? '');
+}
+
+/**
+ * How credits are paid for. It names the ways this server takes once it's
+ * asked; before then, as in the prerendered page, it names none, so it's never
+ * wrong about a server it hasn't asked.
+ */
+function usePayText(): string {
+  const methods = usePaymentMethods();
+  const list = methodList(methods.data?.data.map((m) => m.id) ?? []);
+  return list ? `Add credits by ${list} as you need them. No subscription.` : 'Add credits as you need them. No subscription.';
+}
 
 export default function HomePage() {
   useSeoMeta({
     title: 'Shakespeare AI',
-    description: 'An OpenAI-compatible AI API. Sign in with Nostr, and pay as you go by card, Lightning or bitcoin.',
+    description: 'An OpenAI-compatible AI API. Sign in with Nostr, and pay as you go.',
   });
 
   const { user } = useCurrentUser();
   const models = useModels();
   const endpoint = `${location.origin}/v1`;
+  const features = [
+    { icon: Plug, title: 'OpenAI-compatible', text: 'Point any client or SDK at the endpoint. Nothing else to change.' },
+    { icon: KeyRound, title: 'Your Nostr key', text: 'Sign in and sign requests with it. No email, no password.' },
+    { icon: Wallet, title: 'Pay as you go', text: usePayText() },
+  ];
 
   return (
     <div className="space-y-14">
@@ -67,7 +85,7 @@ export default function HomePage() {
       </section>
 
       <section className="grid gap-3 sm:grid-cols-3">
-        {FEATURES.map(({ icon: Icon, title, text }) => (
+        {features.map(({ icon: Icon, title, text }) => (
           <div key={title} className="rounded-2xl border bg-card p-5">
             <div className="mb-3 inline-flex rounded-lg bg-accent p-2 text-primary">
               <Icon className="size-4.5" aria-hidden />

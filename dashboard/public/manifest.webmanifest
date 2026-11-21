@@ -1,7 +1,7 @@
 {
   "name": "Shakespeare AI",
   "short_name": "Shakespeare AI",
-  "description": "An OpenAI-compatible AI API. Sign in with Nostr, and pay as you go by card, Lightning or bitcoin.",
+  "description": "An OpenAI-compatible AI API. Sign in with Nostr, and pay as you go.",
   "start_url": "/",
   "display": "standalone",
   "theme_color": "#9333ea",
