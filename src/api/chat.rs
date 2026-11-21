@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
+use super::schema::ChatRequest;
 use super::ApiError;
 use crate::app::App;
 use crate::config::{Price, Provider, TokenPrice};
@@ -20,17 +21,12 @@ use crate::store::{self, Generation};
 
 pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let caller = app.authenticate_inference(&method, &uri, &headers, &body).await?;
-    let mut request = super::json_object(&body)?;
-
-    let valid = request.get("model").is_some_and(Value::is_string)
-        && request.get("messages").and_then(Value::as_array).is_some_and(|messages| {
-            messages.iter().all(|m| m.get("role").is_some_and(Value::is_string))
-        })
-        && request.get("stream").is_none_or(|s| s.is_boolean() || s.is_null());
-    if !valid {
+    let raw = super::json_object(&body)?;
+    if !raw.get("model").is_some_and(Value::is_string) {
         return Err(ApiError::invalid("missing_required_parameter", "Missing `model` property").param("model"));
     }
-    let model_id = request["model"].as_str().unwrap_or_default().to_string();
+    let mut request: ChatRequest = serde_json::from_value(Value::Object(raw)).map_err(|error| ApiError::invalid("invalid_parameter", format!("Invalid request: {error}")))?;
+    let model_id = request.model.clone();
     let not_found = || ApiError::invalid("model_not_found", format!("Model '{model_id}' is not supported")).param("model");
     let model = app.config.models.get(&model_id).ok_or_else(not_found)?;
     let Price::Tokens(price) = &model.price else {
@@ -57,11 +53,8 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         }
     }
 
-    let stream = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    request.insert("model".into(), upstream_model.into());
-    if stream {
-        request.insert("stream_options".into(), json!({ "include_usage": true }));
-    }
+    let stream = request.is_stream();
+    let mut request = request.upstream(upstream_model, provider.openrouter);
     if provider.openrouter {
         // https://openrouter.ai/docs/use-cases/usage-accounting
         request.insert("usage".into(), json!({ "include": true }));
@@ -71,13 +64,14 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     }
 
     let upstream_body = serde_json::to_vec(&request).map_err(anyhow::Error::from)?;
-    let response = send(&app, provider, "chat/completions", &headers, upstream_body.clone()).await?;
+    let response = send(&app, provider, "chat/completions", upstream_body.clone()).await?;
 
     let meter = Meter {
         app: app.clone(),
         api_key_id: caller.api_key_id(),
         pubkey: caller.pubkey,
         model_id,
+        upstream_model: upstream_model.to_string(),
         price: TokenPrice { input: price.input, output: price.output },
         free,
         use_reported_cost: provider.openrouter,
@@ -91,6 +85,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         let usage = completion.get("usage").cloned().unwrap_or(Value::Null);
         let content_bytes = completion.pointer("/choices/0/message").map_or(0, |m| m.to_string().len());
         let upstream_id = completion.get("id").and_then(Value::as_str).map(str::to_string);
+        meter.check_model(completion.get("model"));
         let charge = meter.charge(&usage, content_bytes);
         meter.record(upstream_id, &charge, false).await;
 
@@ -106,13 +101,11 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     }
 }
 
-/// POST to a provider, turning its refusals into errors of our own.
-pub async fn send(app: &App, provider: &Provider, path: &str, headers: &HeaderMap, body: Vec<u8>) -> Result<reqwest::Response, ApiError> {
+/// POST to a provider, turning its refusals into errors of our own. Nothing
+/// of the client's request goes with it but the body we wrote.
+pub async fn send(app: &App, provider: &Provider, path: &str, body: Vec<u8>) -> Result<reqwest::Response, ApiError> {
     let url = format!("{}/{path}", provider.base_url.as_str().trim_end_matches('/'));
-    let mut request = app.http.post(url).bearer_auth(&provider.api_key).header(header::CONTENT_TYPE, "application/json").body(body);
-    if let Some(language) = headers.get(header::ACCEPT_LANGUAGE) {
-        request = request.header(header::ACCEPT_LANGUAGE, language);
-    }
+    let request = app.http.post(url).bearer_auth(&provider.api_key).header(header::CONTENT_TYPE, "application/json").body(body);
     let response = request.send().await.map_err(|e| upstream_failure(&e.to_string()))?;
     if response.status().is_success() {
         return Ok(response);
@@ -190,6 +183,8 @@ struct Meter {
     pubkey: String,
     api_key_id: Option<String>,
     model_id: String,
+    /// The provider's id for it, to notice a provider answering with another.
+    upstream_model: String,
     price: TokenPrice,
     free: bool,
     /// OpenRouter reports what each request actually cost (cache discounts
@@ -231,13 +226,37 @@ impl Meter {
             (Some(p), Some(c)) => (p, c, false),
             _ => (estimate_tokens(self.prompt_bytes), estimate_tokens(completion_bytes), true),
         };
-        let reported = usage.get("cost").filter(|_| self.use_reported_cost && !estimated).and_then(decimal_from_json_number).and_then(Money::from_dollars);
-        let cost = if self.free {
-            Money::ZERO
-        } else {
-            reported.filter(|c| c.nanos() >= 0).unwrap_or_else(|| self.price.cost(prompt_tokens, completion_tokens))
+        let reported = usage
+            .get("cost")
+            .filter(|_| self.use_reported_cost && !estimated)
+            .and_then(decimal_from_json_number)
+            .and_then(Money::from_dollars)
+            .filter(|c| c.nanos() >= 0);
+        let cost = match reported {
+            // A free model the provider charged us for anyway (another model
+            // answered, somehow) is charged on: it was never free.
+            Some(cost) if self.free && cost.is_positive() => {
+                crate::log::warn("chat.free_model_charged", json!({ "model": self.model_id, "pubkey": self.pubkey, "cost": cost.to_f64() }));
+                cost
+            }
+            _ if self.free => Money::ZERO,
+            Some(cost) => cost,
+            None => self.price.cost(prompt_tokens, completion_tokens),
         };
         Charge { prompt_tokens, completion_tokens, cost, estimated }
+    }
+
+    /// Log OpenRouter answering with a model other than the one asked for,
+    /// which only its routing options could make it do. (Other providers
+    /// may answer with a dated id for an alias.)
+    fn check_model(&self, model: Option<&Value>) {
+        if self.use_reported_cost
+            && let Some(model) = model.and_then(Value::as_str)
+            && !model.is_empty()
+            && model != self.upstream_model
+        {
+            crate::log::warn("chat.model_mismatch", json!({ "model": self.model_id, "requested": self.upstream_model, "answered": model, "pubkey": self.pubkey }));
+        }
     }
 
     async fn record(&self, upstream_id: Option<String>, charge: &Charge, stream: bool) {
@@ -338,6 +357,9 @@ impl StreamState {
             return Some(Bytes::from(format!("data: {chunk}\n\n")));
         }
         if let Some(id) = chunk.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+            if self.upstream_id.is_none() {
+                meter.check_model(chunk.get("model"));
+            }
             self.upstream_id = Some(id.to_string());
         }
         if let Some(delta) = chunk.pointer("/choices/0/delta").and_then(Value::as_object) {

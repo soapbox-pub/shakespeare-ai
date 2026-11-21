@@ -25,9 +25,16 @@ const SECRET: &str = "0000000000000000000000000000000000000000000000000000000000
 
 /// A provider that streams when asked, slowly enough to hang up on.
 async fn fake_upstream() -> String {
-    async fn chat(body: Bytes) -> axum::response::Response {
+    async fn chat(headers: axum::http::HeaderMap, body: Bytes) -> axum::response::Response {
         let request: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(request["model"], "upstream-model");
+        // Only what our schema names ever gets here.
+        for field in ["models", "provider", "plugins", "route", "n", "user"] {
+            assert!(request.get(field).is_none(), "{field} reached the provider");
+        }
+        assert!(headers.get("accept-language").is_none() && headers.get("x-session-id").is_none());
+        // As OpenRouter does, when asked: what it really cost.
+        let cost = if request["usage"]["include"] == true { json!(0.5) } else { Value::Null };
         if request["stream"] == true {
             assert_eq!(request["stream_options"]["include_usage"], true);
             let chunks = vec![
@@ -45,7 +52,7 @@ async fn fake_upstream() -> String {
         axum::Json(json!({
             "id": "up-2", "object": "chat.completion", "created": 1700000000,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000},
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000, "cost": cost},
             "system_fingerprint": "dropped",
         }))
         .into_response()
@@ -72,6 +79,10 @@ providers:
   fake:
     base_url: {upstream}
     api_key: test
+  router:
+    base_url: {upstream}
+    api_key: test
+    openrouter: true
 models:
   paid:
     upstream: fake/upstream-model
@@ -79,6 +90,10 @@ models:
     price: {{ input: 3, output: 15 }}
   free:
     upstream: fake/upstream-model
+    context_window: 1000
+    price: {{ input: 0, output: 0 }}
+  routed-free:
+    upstream: router/upstream-model
     context_window: 1000
     price: {{ input: 0, output: 0 }}
   gpt-image-1:
@@ -172,6 +187,45 @@ async fn refuses_without_credit_and_charges_for_completions() {
     assert_eq!(list["data"].as_array().unwrap().len(), 2);
     let costs: Vec<f64> = list["data"].as_array().unwrap().iter().map(|g| g["cost"].as_f64().unwrap()).collect();
     assert!(costs.contains(&0.018) && costs.contains(&0.0), "{costs:?}");
+}
+
+#[tokio::test]
+async fn sends_providers_only_what_the_schema_allows() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let mut request = signed(
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "paid",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "models": ["anthropic/claude-opus-4"],
+            "provider": { "order": ["x"] },
+            "plugins": [{ "id": "web" }],
+            "route": "fallback",
+            "n": 8,
+            "user": "u",
+        })),
+    );
+    request.headers_mut().insert("accept-language", "fr".parse().unwrap());
+    request.headers_mut().insert("x-session-id", "s".parse().unwrap());
+    let (status, body) = json_of(router(app.clone()).oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A field in the schema with the wrong shape is refused.
+    let bad = signed("POST", "/v1/chat/completions", Some(json!({ "model": "paid", "messages": [{ "role": "function", "content": "x" }] })));
+    let (status, body) = json_of(router(app.clone()).oneshot(bad).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("invalid_parameter")));
+}
+
+#[tokio::test]
+async fn charges_a_free_model_whatever_the_provider_charged() {
+    let (app, _t) = setup().await;
+    let request = signed("POST", "/v1/chat/completions", Some(json!({ "model": "routed-free", "messages": [{ "role": "user", "content": "hi" }] })));
+    let (status, body) = json_of(router(app.clone()).oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["usage"]["cost"], 0.5);
+    assert_eq!(balance(&app), Money(-500_000_000));
 }
 
 #[tokio::test]

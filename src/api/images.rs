@@ -65,7 +65,7 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
             upstream.insert(key.into(), value.clone());
         }
     }
-    let response = send(&app, provider, "images/generations", &headers, serde_json::to_vec(&upstream).map_err(anyhow::Error::from)?).await?;
+    let response = send(&app, provider, "images/generations", serde_json::to_vec(&upstream).map_err(anyhow::Error::from)?).await?;
     let mut result: Value = response.json().await.map_err(|e| upstream_failure(&e.to_string()))?;
 
     // Charge for what was made, as the provider describes it.

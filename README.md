@@ -195,6 +195,17 @@ of their own, since their effects are already in the opening balances.
   must carry a `payload` tag. Every known client (nostrify's `NIP98Client`,
   the opencode plugin) sends one. Without it, a seen header could be replayed
   with a different body.
+- **Chat requests are parsed, not passed through.** A request is read into
+  the part of OpenAI's chat API that providers share (`messages` with text
+  and image parts and tool calls, `tools`, `tool_choice`, `max_tokens`,
+  `max_completion_tokens`, `temperature`, `top_p`, `stop`, `seed`, the
+  penalties, `parallel_tool_calls`, `response_format`) plus
+  `reasoning_effort`, and the provider's request is written from that.
+  Anything else is ignored, so a client can't reach a provider's own options
+  (OpenRouter's `models` fallbacks could run any model on a free one), and
+  `n` is gone. A field in the schema with the wrong shape is a 400. No client
+  header is passed on, `Accept-Language` included. If OpenRouter reports a
+  cost for a free model anyway, it's charged.
 - **Interrupted streams are charged for.** If a client hangs up before the
   provider reports usage, tokens are estimated from bytes sent and received
   (about four per token), and the generation is marked `estimated`. These used

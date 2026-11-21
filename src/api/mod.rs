@@ -6,6 +6,7 @@ pub mod giftcards;
 pub mod images;
 pub mod keys;
 pub mod models;
+pub mod schema;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
