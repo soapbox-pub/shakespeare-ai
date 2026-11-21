@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createHead, UnheadProvider } from '@unhead/react/client';
 import { BrowserRouter } from 'react-router-dom';
-import { NostrLoginProvider } from '@nostrify/react/login';
+import { NostrLoginProvider } from '@/components/NostrLoginProvider';
 import NostrProvider from '@/components/NostrProvider';
 import { AppProvider } from '@/components/AppProvider';
 import { AppConfig } from '@/contexts/AppContext';

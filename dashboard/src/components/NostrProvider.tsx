@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { type NostrSigner, NostrEvent, NostrFilter, NPool, NRelay1 } from '@nostrify/nostrify';
 import { getEventHash, verifyEvent } from 'nostr-tools';
 import { NostrContext } from '@nostrify/react';
-import { NUser, useNostrLogin } from '@nostrify/react/login';
+import { NUser } from '@nostrify/react/login';
+import { useNostrLogin } from '@/hooks/useNostrLogin';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAppContext } from '@/hooks/useAppContext';
 

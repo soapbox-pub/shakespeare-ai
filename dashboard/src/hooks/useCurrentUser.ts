@@ -1,4 +1,5 @@
-import { type NLoginType, NUser, useNostrLogin } from '@nostrify/react/login';
+import { type NLoginType, NUser } from '@nostrify/react/login';
+import { useNostrLogin } from '@/hooks/useNostrLogin';
 import { useNostr } from '@nostrify/react';
 import { useCallback, useMemo } from 'react';
 

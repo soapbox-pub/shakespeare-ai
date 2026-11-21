@@ -1,8 +1,11 @@
 //! Serving the built dashboard SPA (`dashboard/`).
 //!
-//! Unknown paths fall back to `index.html` so client-side routes work on a
-//! hard refresh. Vite's hashed assets are immutable; everything else is
-//! revalidated each time.
+//! A path is its file, or else its directory's `index.html`: the build
+//! prerenders the public pages (`/`, `/docs`, `/terms`) that way, for crawlers
+//! that don't run JavaScript. Any other path is one of the app's routes, and
+//! gets `200.html`, the app with no page drawn in it, so a hard refresh works
+//! (or `index.html`, from a build before prerendering). Vite's hashed assets
+//! are immutable; everything else is revalidated each time.
 //!
 //! With the `embedded-dashboard` feature the files are compiled in (see
 //! build.rs), so a release is one binary whose dashboard can't drift from its
@@ -69,15 +72,9 @@ impl Source {
     /// the blocking pool.
     pub fn serve(&self, path: &str, headers: &HeaderMap) -> Response {
         let relative = normalize(path);
-        let (relative, bytes) = match self.read(&relative) {
-            Some(bytes) => (relative, bytes),
-            None => match self.read(Path::new("index.html")) {
-                Some(bytes) => (PathBuf::from("index.html"), bytes),
-                None => {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "The dashboard hasn't been built. Run `npm ci && npm run build` in dashboard/.")
-                        .into_response();
-                }
-            },
+        let candidates = [relative.clone(), relative.join("index.html"), PathBuf::from("200.html"), PathBuf::from("index.html")];
+        let Some((relative, bytes)) = candidates.into_iter().find_map(|path| self.read(&path).map(|bytes| (path, bytes))) else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "The dashboard hasn't been built. Run `npm ci && npm run build` in dashboard/.").into_response();
         };
 
         let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&bytes))[..32]);
@@ -162,6 +159,23 @@ mod tests {
         let mut revalidate = HeaderMap::new();
         revalidate.insert(header::IF_NONE_MATCH, response.headers()["etag"].clone());
         assert_eq!(source.serve("/", &revalidate).status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn serves_prerendered_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("index.html"), "home").unwrap();
+        std::fs::write(dir.path().join("200.html"), "app").unwrap();
+        std::fs::write(dir.path().join("docs/index.html"), "docs").unwrap();
+        let source = Source::Disk(vec![dir.path().to_path_buf()]);
+
+        for (path, expected) in [("/", "home"), ("/docs", "docs"), ("/docs/", "docs"), ("/credits", "app"), ("/no/such/page", "app")] {
+            let response = source.serve(path, &HeaderMap::new());
+            assert_eq!(response.headers()["content-type"], "text/html; charset=utf-8", "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body, expected, "{path}");
+        }
     }
 
     #[test]

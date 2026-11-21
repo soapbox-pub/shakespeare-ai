@@ -46,7 +46,16 @@ terms at `/docs` and `/terms`. A gift card's link is
 NIP-98, as any client does, so there are no sessions or cookies.
 
 Any path that isn't the API's (`/v1/…`, `/webhooks/…`,
-`/metrics`) is the dashboard's, falling back to its `index.html`.
+`/metrics`) is the dashboard's: a file, or its directory's `index.html`, or
+else `200.html`, the app with no page in it.
+
+`npm run build` prerenders the public pages (`/`, `/docs` and `/terms`, as
+someone logged out sees them) into that `index.html` for each, so crawlers and
+link previews that don't run JavaScript get the whole page
+(`dashboard/src/prerender.tsx`). The app replaces it as it starts. The pages
+show the API's address, which isn't known at build time: they're prerendered
+with `https://ai.shakespeare.diy`, or `PRERENDER_ORIGIN` if it's set, and the
+app puts in the real one.
 `GET /v1/credits/methods` tells it the payment methods configured, the minimum
 and the fee.
 

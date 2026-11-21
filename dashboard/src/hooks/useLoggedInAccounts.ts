@@ -1,5 +1,5 @@
 import { useNostr } from '@nostrify/react';
-import { useNostrLogin } from '@nostrify/react/login';
+import { useNostrLogin } from '@/hooks/useNostrLogin';
 import { useQuery } from '@tanstack/react-query';
 import { NSchema as n, NostrEvent, NostrMetadata } from '@nostrify/nostrify';
 

@@ -6,7 +6,8 @@ export function ScrollToTop() {
 
   useEffect(() => {
     // The page scrolls inside the layout's panel, not the window.
-    document.getElementById('main')?.scrollTo(0, 0);
+    const main = document.getElementById('main');
+    if (main) main.scrollTop = 0;
     window.scrollTo(0, 0);
   }, [pathname]);
 

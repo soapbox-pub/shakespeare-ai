@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { generateSecretKey, nip19, getPublicKey } from 'nostr-tools';
-import { useNostrLogin } from '@nostrify/react/login';
+import { useNostrLogin } from '@/hooks/useNostrLogin';
 
 import { TestApp } from '@/test/TestApp';
 import { useLoginActions } from './useLoginActions';

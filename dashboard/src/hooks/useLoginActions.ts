@@ -4,8 +4,8 @@ import {
   type NLoginType,
   type NostrConnectParams,
   type NostrConnectStatus,
-  useNostrLogin,
 } from '@nostrify/react/login';
+import { useNostrLogin } from '@/hooks/useNostrLogin';
 import { useAppContext } from '@/hooks/useAppContext';
 import { APP_RELAYS } from '@/lib/appRelays';
 

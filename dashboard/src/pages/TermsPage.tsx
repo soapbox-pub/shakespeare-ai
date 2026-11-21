@@ -4,7 +4,10 @@ import { Note, Prose } from '@/components/Doc';
 import { PageHeader } from '@/components/PageHeader';
 
 export default function TermsPage() {
-  useSeoMeta({ title: 'Terms of service · Shakespeare AI' });
+  const title = 'Terms of service · Shakespeare AI';
+  const description = 'The terms of service for Shakespeare AI.';
+  // Given, not inferred: index.html's own og: tags would win.
+  useSeoMeta({ title, description, ogTitle: title, ogDescription: description });
 
   return (
     <div className="mx-auto max-w-3xl space-y-8">

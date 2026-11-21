@@ -15,7 +15,10 @@ const SECTIONS = [
 ];
 
 export default function DocsPage() {
-  useSeoMeta({ title: 'API documentation · Shakespeare AI' });
+  const title = 'API documentation · Shakespeare AI';
+  const description = "Shakespeare AI's OpenAI-compatible API: authentication with Nostr or API keys, models, chat completions, credits and errors.";
+  // Given, not inferred: index.html's own og: tags would win.
+  useSeoMeta({ title, description, ogTitle: title, ogDescription: description });
   useHashScroll();
   const base = `${location.origin}/v1`;
 
