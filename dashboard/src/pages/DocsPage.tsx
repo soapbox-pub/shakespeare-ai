@@ -115,10 +115,21 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
                 ['model', 'string', 'Yes', 'Model to use (glm-4.6, claude-sonnet-4.5, claude-opus-4.5)'],
                 ['messages', 'array', 'Yes', 'Array of message objects'],
                 ['temperature', 'number', 'No', 'Sampling temperature (0-2)'],
-                ['max_tokens', 'integer', 'No', 'Maximum tokens to generate'],
+                ['max_tokens', 'integer', 'No', 'Maximum tokens to generate (or max_completion_tokens)'],
                 ['stream', 'boolean', 'No', 'Whether to stream responses'],
+                ['tools', 'array', 'No', 'Functions the model may call'],
+                ['tool_choice', 'string or object', 'No', 'none, auto, required, or a function by name'],
+                ['parallel_tool_calls', 'boolean', 'No', 'Whether the model may call several tools at once'],
+                ['response_format', 'object', 'No', 'text, json_object, or json_schema'],
+                ['reasoning_effort', 'string', 'No', 'none, minimal, low, medium, high or xhigh, for models that reason'],
+                ['top_p, stop, seed, frequency_penalty, presence_penalty', '', 'No', 'As in OpenAI\'s API'],
               ]}
             />
+            <p>
+              Messages are <code>system</code>, <code>developer</code>, <code>user</code>, <code>assistant</code> (with{' '}
+              <code>tool_calls</code>) or <code>tool</code>, with text and <code>image_url</code> parts. Any other field
+              is ignored, and <code>n</code> isn't supported. An account can have 4 requests running at once.
+            </p>
 
             <h4>Example Request</h4>
             <Code>{`{
@@ -358,6 +369,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
                 ['401', 'unauthorized', 'Invalid or missing NIP-98 authentication'],
                 ['400', 'invalid_request_error', 'Invalid request format or parameters'],
                 ['429', 'insufficient_quota', 'Insufficient credits for premium models'],
+                ['429', 'rate_limit_error', 'Too many requests running at once, or payments started this hour'],
                 ['500', 'api_error', 'Internal server or upstream provider error'],
               ]}
             />
