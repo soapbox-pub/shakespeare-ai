@@ -303,35 +303,89 @@ impl<'de> Deserialize<'de> for Upstream {
 /// Request fields that `params` can't set: they're the request itself.
 const RESERVED_PARAMS: &[&str] = &["model", "messages", "prompt", "n", "stream", "stream_options"];
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// What clients ask for by id. `type` says which endpoint serves it, and
+/// so how it's priced.
+#[derive(Debug)]
 pub struct Model {
     /// Tried in order, skipping any that's cooling down after failures.
     pub upstreams: Vec<Upstream>,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub description: String,
     /// Kept out of `/v1/models`, but still callable by id. Free chat models
     /// are always hidden.
-    #[serde(default)]
     pub hidden: bool,
-    #[serde(default)]
-    pub context_window: Option<u64>,
     /// Shown in `/v1/models` as `created`.
-    #[serde(default)]
     pub created: Option<i64>,
-    pub price: Price,
+    pub kind: Kind,
 }
 
-/// How a model is priced, which is also what kind of model it is.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum Price {
-    /// USD per million tokens.
-    Tokens(TokenPrice),
-    /// USD per image, by quality and shape.
-    Image(ImagePrice),
+#[derive(Debug)]
+pub enum Kind {
+    /// `type: chat`: `/v1/chat/completions`, priced per token.
+    Chat { context_window: u64, price: TokenPrice },
+    /// `type: image`: `/v1/images/generations`, priced per image.
+    Image { price: ImagePrice },
+}
+
+impl<'de> Deserialize<'de> for Model {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Each type's fields, all of them, so that a field the type doesn't
+        // have is named as unknown. (Flattening the shared ones in would
+        // lose `deny_unknown_fields`.)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Chat {
+            upstreams: Vec<Upstream>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            description: String,
+            #[serde(default)]
+            hidden: bool,
+            #[serde(default)]
+            created: Option<i64>,
+            context_window: u64,
+            price: TokenPrice,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Image {
+            upstreams: Vec<Upstream>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            description: String,
+            #[serde(default)]
+            hidden: bool,
+            #[serde(default)]
+            created: Option<i64>,
+            price: ImagePrice,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "lowercase")]
+        enum Raw {
+            Chat(Chat),
+            Image(Image),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Chat(m) => Model {
+                upstreams: m.upstreams,
+                name: m.name,
+                description: m.description,
+                hidden: m.hidden,
+                created: m.created,
+                kind: Kind::Chat { context_window: m.context_window, price: m.price },
+            },
+            Raw::Image(m) => Model {
+                upstreams: m.upstreams,
+                name: m.name,
+                description: m.description,
+                hidden: m.hidden,
+                created: m.created,
+                kind: Kind::Image { price: m.price },
+            },
+        })
+    }
 }
 
 /// USD per million tokens. Cached input is priced on its own: reading it
@@ -385,7 +439,7 @@ pub struct ImageSizes {
 
 impl Model {
     pub fn is_free_chat(&self) -> bool {
-        matches!(&self.price, Price::Tokens(p) if p.is_free())
+        matches!(&self.kind, Kind::Chat { price, .. } if price.is_free())
     }
 }
 
@@ -487,15 +541,12 @@ impl Config {
                 if let Some(key) = upstream.params.keys().find(|k| RESERVED_PARAMS.contains(&k.as_str())) {
                     bail!("model {id}: params can't set {key}");
                 }
-                if matches!(model.price, Price::Image(_)) && provider.api != Api::Openai {
+                if matches!(model.kind, Kind::Image { .. }) && provider.api != Api::Openai {
                     bail!("model {id}: image models need providers with api: openai, and {} isn't one", upstream.provider);
                 }
             }
-            match &model.price {
-                Price::Tokens(price) => {
-                    if model.context_window.is_none() {
-                        bail!("model {id}: chat models need a context_window");
-                    }
+            match &model.kind {
+                Kind::Chat { price, .. } => {
                     if [price.input, price.output, price.cache_read(), price.cache_write()].iter().any(|p| *p < Decimal::ZERO) {
                         bail!("model {id}: prices can't be negative");
                     }
@@ -503,7 +554,7 @@ impl Config {
                         bail!("model {id}: cache_read costs more than input, which is surely a mistake");
                     }
                 }
-                Price::Image(_) => {}
+                Kind::Image { .. } => {}
             }
         }
         Ok(())
@@ -538,13 +589,13 @@ mod tests {
         let sonnet = &config.models["claude-sonnet-4.6"];
         let labels: Vec<String> = sonnet.upstreams.iter().map(Upstream::label).collect();
         assert_eq!(labels, ["anthropic/claude-sonnet-4-6", "openrouter/anthropic/claude-sonnet-4.6"]);
-        let Price::Tokens(price) = &sonnet.price else { panic!() };
+        let Kind::Chat { price, context_window: 200000 } = &sonnet.kind else { panic!() };
         assert_eq!(price.cost(Tokens { input: 1_000_000, ..Tokens::default() }), Money(3_000_000_000));
         assert_eq!(price.cost(Tokens { input: 1, output: 1, ..Tokens::default() }), Money(18_000));
         // A million in: half read from the cache, a quarter written to it.
         let cached = Tokens { input: 1_000_000, cache_read: 500_000, cache_write: 250_000, output: 0 };
         assert_eq!(price.cost(cached), Money(750_000_000 + 150_000_000 + 937_500_000));
-        assert!(matches!(config.models["gpt-image-1"].price, Price::Image(_)));
+        assert!(matches!(config.models["gpt-image-1"].kind, Kind::Image { .. }));
         let gemma = &config.models["gemma-4-26b"];
         assert_eq!(gemma.upstreams[0].label(), "openrouter/google/gemma-4-26b-a4b-it");
         assert!(gemma.is_free_chat());
@@ -557,15 +608,20 @@ mod tests {
     fn rejects_mistakes() {
         let base = "origin: https://ai.example.com\ndatabase: x.db\nproviders:\n  p:\n    api: openai\n    base_url: https://p.example.com/v1\n    api_key: k\n  r:\n    api: openrouter\n    api_key: k\n";
         let err = |models: &str| Config::parse(&format!("{base}models:\n{models}")).unwrap_err().to_string();
-        let chat = "    context_window: 1\n    price: {input: 1, output: 1}\n";
+        let chat = "    type: chat\n    context_window: 1\n    price: {input: 1, output: 1}\n";
         assert!(err(&format!("  m:\n    upstreams: [q/x]\n{chat}")).contains("no provider named q"));
         assert!(err(&format!("  m:\n    upstreams: [p]\n{chat}")).contains("provider/model"));
         assert!(err(&format!("  m:\n    upstreams: []\n{chat}")).contains("can't be empty"));
-        assert!(err("  m:\n    upstreams: [p/x]\n    price: {input: 1, output: 1}\n").contains("context_window"));
+        assert!(err("  m:\n    type: chat\n    upstreams: [p/x]\n    price: {input: 1, output: 1}\n").contains("context_window"));
+        // The type is required, and decides which fields there are.
+        assert!(err("  m:\n    upstreams: [p/x]\n    context_window: 1\n    price: {input: 1, output: 1}\n").contains("type"));
+        assert!(err("  m:\n    type: video\n    upstreams: [p/x]\n").contains("video"));
+        assert!(err("  m:\n    type: chat\n    upstreams: [p/x]\n    context_window: 1\n    price: {input: 1, output: 1, cache_reed: 1}\n").contains("cache_reed"));
         assert!(err(&format!("  m:\n    upstreams: [{{provider: p, model: x, params: {{stream: false}}}}]\n{chat}")).contains("can't set stream"));
-        assert!(err("  m:\n    upstreams: [p/x]\n    context_window: 1\n    price: {input: 1, output: 1, cache_read: 2}\n").contains("cache_read"));
-        let image = "    price: {low: {square: 1, wide: 1}, medium: {square: 1, wide: 1}, high: {square: 1, wide: 1}}\n";
+        assert!(err("  m:\n    type: chat\n    upstreams: [p/x]\n    context_window: 1\n    price: {input: 1, output: 1, cache_read: 2}\n").contains("cache_read"));
+        let image = "    type: image\n    price: {low: {square: 1, wide: 1}, medium: {square: 1, wide: 1}, high: {square: 1, wide: 1}}\n";
         assert!(err(&format!("  m:\n    upstreams: [r/x]\n{image}")).contains("api: openai"));
+        assert!(err(&format!("  m:\n    upstreams: [p/x]\n    context_window: 1\n{image}")).contains("context_window"));
         assert!(Config::parse(&format!("{base}models: {{}}\ntypo: 1\n")).is_err());
         assert!(Config::parse(&format!("{base}models: {{}}\nrouting: {{cooldown: soon}}\n")).unwrap_err().to_string().contains("duration"));
 
@@ -574,7 +630,7 @@ mod tests {
         assert_eq!((m.upstreams[0].label(), m.upstreams[1].label()), ("r/a/b".into(), "p/c".into()));
         assert_eq!(m.upstreams[0].params["provider"]["order"][0], "x");
         assert_eq!((config.routing.cooldown, config.routing.connect_timeout), (Duration::from_secs(120), Duration::from_secs(5)));
-        let Price::Tokens(price) = &m.price else { panic!() };
+        let Kind::Chat { price, .. } = &m.kind else { panic!() };
         assert_eq!((price.cache_read(), price.cache_write()), (Decimal::ONE, Decimal::ONE));
 
         let bitcoin = |section: &str| Config::parse(&format!("{base}models: {{}}\npayments:\n  bitcoin:\n{section}"));

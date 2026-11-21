@@ -18,7 +18,7 @@ use super::schema::ChatRequest;
 use super::upstream::{self, upstream_failure, Failure};
 use super::ApiError;
 use crate::app::App;
-use crate::config::{Api, Price, Provider, TokenPrice, Tokens, Upstream};
+use crate::config::{Api, Kind, Provider, TokenPrice, Tokens, Upstream};
 use crate::money::{decimal_from_json_number, Money};
 use crate::store::{self, Generation};
 
@@ -32,7 +32,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     let model_id = request.model.clone();
     let not_found = || ApiError::invalid("model_not_found", format!("Model '{model_id}' is not supported")).param("model");
     let model = app.config.models.get(&model_id).ok_or_else(not_found)?;
-    let Price::Tokens(price) = &model.price else {
+    let Kind::Chat { price, .. } = &model.kind else {
         return Err(ApiError::invalid("invalid_model_type", format!("Model '{model_id}' cannot be used with the chat completions endpoint"))
             .param("model"));
     };

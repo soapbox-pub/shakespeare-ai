@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde_json::{json, Value};
 
 use crate::app::App;
-use crate::config::{Model, Price};
+use crate::config::{Kind, Model};
 
 /// What `/v1/models` has always said for `created`.
 const DEFAULT_CREATED: i64 = 1757894400;
@@ -26,11 +26,11 @@ fn describe(id: &str, model: &Model) -> Value {
         "owned_by": "system",
         "created": model.created.unwrap_or(DEFAULT_CREATED),
     });
-    match &model.price {
-        Price::Tokens(price) => {
+    match &model.kind {
+        Kind::Chat { context_window, price } => {
             let per_token = |p: Decimal| (p / Decimal::from(1_000_000)).normalize().to_string();
             out["type"] = "chat".into();
-            out["context_window"] = model.context_window.into();
+            out["context_window"] = (*context_window).into();
             out["pricing"] = json!({
                 "prompt": per_token(price.input),
                 "completion": per_token(price.output),
@@ -38,7 +38,7 @@ fn describe(id: &str, model: &Model) -> Value {
                 "input_cache_write": per_token(price.cache_write()),
             });
         }
-        Price::Image(price) => {
+        Kind::Image { price } => {
             let s = |p: Decimal| p.normalize().to_string();
             out["type"] = "image".into();
             out["pricing"] = json!({

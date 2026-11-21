@@ -77,6 +77,10 @@ providers:
 
 # What clients ask for, by id.
 #
+# `type` says which endpoint serves a model, and so how it's priced: `chat`
+# for /v1/chat/completions, with a `context_window` and a price per million
+# tokens, or `image` for /v1/images/generations, priced per image.
+#
 # `upstreams` are tried in order. Each is provider/model, everything after the
 # first slash being the provider's own model id, or the long form
 # `{ provider, model, params }`, whose `params` are merged into each request
@@ -88,6 +92,7 @@ providers:
 # without disabling it; free chat models are always hidden.
 models:
   claude-sonnet-4.6:
+    type: chat
     name: Claude Sonnet 4.6
     description: Highly capable programming model, able to understand and perform complex tasks.
     context_window: 200000
@@ -97,6 +102,7 @@ models:
       - openrouter/anthropic/claude-sonnet-4.6
 
   claude-opus-4.8:
+    type: chat
     name: Claude Opus 4.8
     description: If money is no obstacle, this model can get the job done.
     context_window: 200000
@@ -104,6 +110,7 @@ models:
     upstreams: [anthropic/claude-opus-4-8]
 
   claude-sonnet-4.5:
+    type: chat
     name: Claude Sonnet 4.5
     hidden: true
     context_window: 200000
@@ -111,6 +118,7 @@ models:
     upstreams: [anthropic/claude-sonnet-4-5-20250929]
 
   claude-opus-4.5:
+    type: chat
     name: Claude Opus 4.5
     hidden: true
     context_window: 200000
@@ -118,6 +126,7 @@ models:
     upstreams: [anthropic/claude-opus-4-5-20251101]
 
   claude-opus-4.6:
+    type: chat
     name: Claude Opus 4.6
     hidden: true
     context_window: 200000
@@ -126,6 +135,7 @@ models:
 
   # Hidden: they misbehave in Shakespeare for now.
   claude-sonnet-5:
+    type: chat
     name: Claude Sonnet 5
     hidden: true
     context_window: 200000
@@ -133,6 +143,7 @@ models:
     upstreams: [anthropic/claude-sonnet-5]
 
   claude-opus-5:
+    type: chat
     name: Claude Opus 5
     hidden: true
     context_window: 200000
@@ -141,6 +152,7 @@ models:
 
   # Free, and so unlisted; Ditto's buddy uses it by id.
   gemma-4-26b:
+    type: chat
     name: Gemma 4 26B A4B
     description: Google DeepMind's instruction-tuned Mixture-of-Experts model.
     context_window: 262144
@@ -154,6 +166,7 @@ models:
   # Image models are priced per image, by quality and shape, and need
   # providers with api: openai.
   gpt-image-1:
+    type: image
     name: GPT Image 1
     description: Generate high-quality images from text descriptions.
     price:

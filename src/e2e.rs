@@ -161,43 +161,52 @@ routing:
   cooldown: 1h
 models:
   fallback:
+    type: chat
     hidden: true
     upstreams: [down/upstream-model, fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
   slow-fallback:
+    type: chat
     hidden: true
     upstreams: [silent/upstream-model, fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
   refused:
+    type: chat
     hidden: true
     upstreams: [refuses/upstream-model, fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
   claude:
+    type: chat
     hidden: true
     upstreams: [claude/claude-test]
     context_window: 1000
     price: {{ input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }}
   cached:
+    type: chat
     hidden: true
     upstreams: [router/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }}
   paid:
+    type: chat
     upstreams: [fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
   free:
+    type: chat
     upstreams: [fake/upstream-model]
     context_window: 1000
     price: {{ input: 0, output: 0 }}
   routed-free:
+    type: chat
     upstreams: [router/upstream-model]
     context_window: 1000
     price: {{ input: 0, output: 0 }}
   gpt-image-1:
+    type: image
     upstreams: [down/gpt-image-1, fake/gpt-image-1]
     price:
       low: {{ square: 0.011, wide: 0.016 }}

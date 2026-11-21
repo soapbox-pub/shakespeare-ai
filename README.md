@@ -84,7 +84,10 @@ YAML; see `config.example.yaml`, which documents every field. In short:
   `openrouter`, OpenAI's with OpenRouter's usage accounting and Anthropic
   prompt caching breakpoints; or `anthropic`, see below), an `api_key`, and a
   `base_url` if it isn't the usual one for `api`.
-- **models**: what clients ask for by id, each with a list of `upstreams`
+- **models**: what clients ask for by id. Each has a `type`, which says
+  which endpoint serves it and so which fields it has: `chat` for
+  `/v1/chat/completions`, or `image` for `/v1/images/generations`. `/v1/models`
+  says the same in each model's `type`. Each has a list of `upstreams`
   tried in order. An upstream is `provider/model`, everything after the first
   slash being the provider's own id (`openrouter/anthropic/claude-sonnet-4.6`),
   or `{ provider, model, params }`, whose `params` are merged into each

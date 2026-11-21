@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use super::upstream::{self, upstream_failure};
 use super::ApiError;
 use crate::app::App;
-use crate::config::{ImagePrice, Price};
+use crate::config::{ImagePrice, Kind};
 use crate::money::Money;
 use crate::store::{self, Generation};
 
@@ -27,7 +27,7 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
 
     let not_found = || ApiError::invalid("model_not_found", format!("Model '{}' is not supported", params.model)).param("model");
     let model = app.config.models.get(&params.model).ok_or_else(not_found)?;
-    let Price::Image(price) = &model.price else {
+    let Kind::Image { price } = &model.kind else {
         return Err(ApiError::invalid("invalid_model_type", format!("Model '{}' cannot be used with the image generations endpoint", params.model))
             .param("model"));
     };
