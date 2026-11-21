@@ -1,5 +1,6 @@
 //! The BTC/USD exchange rate, from Coinbase, else CoinGecko, cached for five
-//! minutes, and stale rather than missing when both are down.
+//! minutes, and stale rather than missing when both are down, but not for
+//! long: an invoice priced at last week's rate could be for far too little.
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -9,6 +10,8 @@ use parking_lot::Mutex;
 use rust_decimal::Decimal;
 
 const FRESH_FOR: Duration = Duration::from_secs(5 * 60);
+/// How old a rate may be and still be used when neither source answers.
+const USABLE_FOR: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Default)]
 pub struct Rates {
@@ -29,7 +32,7 @@ impl Rates {
                 *self.btc_usd.lock() = Some((rate, Instant::now()));
                 Ok(rate)
             }
-            Err(error) => cached.map(|(rate, _)| rate).ok_or(error),
+            Err(error) => cached.filter(|(_, at)| at.elapsed() < USABLE_FOR).map(|(rate, _)| rate).ok_or(error),
         }
     }
 }
