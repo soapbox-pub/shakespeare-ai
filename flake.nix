@@ -20,7 +20,7 @@
           };
           # Refresh with `prefetch-npm-deps dashboard/package-lock.json` when
           # the dashboard's dependencies change.
-          npmDepsHash = "sha256-WCMyUHMtEdBLTMb0+Z3K7HT44NvJTXUQZcbl7sJykKc=";
+          npmDepsHash = "sha256-Rw8AheuKexuw3TdclYqD80IQZkcoK5l/8uPfPT0w/4g=";
           installPhase = "cp -r dist $out";
         };
 
