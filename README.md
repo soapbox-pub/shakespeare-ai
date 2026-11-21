@@ -212,6 +212,11 @@ of their own, since their effects are already in the opening balances.
   must carry a `payload` tag. Every known client (nostrify's `NIP98Client`,
   the opencode plugin) sends one. Without it, a seen header could be replayed
   with a different body.
+- **A signed request can't be sent twice.** A NIP-98 event that authorized a
+  POST, PATCH or DELETE is refused if it comes again, so a header seen in a
+  log or a proxy can't buy another gift card with the same body. (Reads may
+  repeat; they show nothing new.) Signers must use fresh randomness in each
+  signature, as nostr-tools and nostrify do.
 - **Chat requests are parsed, not passed through.** A request is read into
   the part of OpenAI's chat API that providers share (`messages` with text
   and image parts and tool calls, `tools`, `tool_choice`, `max_tokens`,

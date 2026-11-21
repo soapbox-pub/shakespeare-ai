@@ -618,6 +618,28 @@ async fn validates_api_keys() {
 }
 
 #[tokio::test]
+async fn refuses_a_replayed_authorization() {
+    let (app, _t) = setup().await;
+    give(&app, 20);
+    let body = serde_json::to_vec(&json!({ "amount": 5 })).unwrap();
+    let auth = sign_nip98(SECRET, "POST", "https://ai.example.com/v1/credits/giftcards", Some(&body), crate::util::now());
+    let request = || {
+        Request::builder().method("POST").uri("/v1/credits/giftcards").header("authorization", &auth).body(Body::from(body.clone())).unwrap()
+    };
+    assert_eq!(router(app.clone()).oneshot(request()).await.unwrap().status(), StatusCode::OK);
+    let (status, error) = json_of(router(app.clone()).oneshot(request()).await.unwrap()).await;
+    assert_eq!((status, &error["error"]["code"]), (StatusCode::UNAUTHORIZED, &json!("invalid_authorization")));
+    assert_eq!(balance(&app), Money(15_000_000_000));
+
+    // A read may be sent again: it shows nothing new.
+    let auth = sign_nip98(SECRET, "GET", "https://ai.example.com/v1/credits", None, crate::util::now());
+    for _ in 0..2 {
+        let request = Request::builder().uri("/v1/credits").header("authorization", &auth).body(Body::empty()).unwrap();
+        assert_eq!(router(app.clone()).oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
 async fn serves_metrics_apart_from_clients() {
     let (app, _t) = setup().await;
     let request = |method: &str, path: &str| Request::builder().method(method).uri(path).body(Body::empty()).unwrap();

@@ -1,6 +1,6 @@
 //! The service's shared state, and its routes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +33,38 @@ pub struct App {
     in_flight: Mutex<HashMap<String, usize>>,
     /// When each thing [`App::not_since`] was asked about last went ahead.
     last_done: Mutex<HashMap<String, Instant>>,
+    /// NIP-98 events already used.
+    seen_auth: Mutex<SeenEvents>,
+}
+
+/// The signatures of NIP-98 events seen while they could still be
+/// accepted, so each authorizes one request: a header someone saw in a log
+/// or a proxy can't be sent again, even with the same body. Signatures
+/// rather than ids: two identical requests signed in the same second share
+/// an id, but a signer's fresh randomness gives each its own signature,
+/// while a replay copies it.
+#[derive(Default)]
+pub struct SeenEvents {
+    ids: HashSet<String>,
+    /// Each id with when it can be forgotten, oldest first.
+    expiries: VecDeque<(i64, String)>,
+}
+
+impl SeenEvents {
+    /// Whether `id` (a signature) is new, remembering it if so.
+    fn first_sight(&mut self, id: &str, now: i64) -> bool {
+        while self.expiries.front().is_some_and(|(at, _)| *at < now) {
+            if let Some((_, old)) = self.expiries.pop_front() {
+                self.ids.remove(&old);
+            }
+        }
+        if !self.ids.insert(id.to_string()) {
+            return false;
+        }
+        // An event is good from MAX_AUTH_AGE before now to as long after.
+        self.expiries.push_back((now + 2 * crate::nostr::MAX_AUTH_AGE + 1, id.to_string()));
+        true
+    }
 }
 
 /// How many inference requests one account may have running at once.
@@ -81,6 +113,7 @@ impl App {
             dashboard: crate::dashboard::source(),
             in_flight: Mutex::default(),
             last_done: Mutex::default(),
+            seen_auth: Mutex::default(),
         })
     }
 
@@ -130,8 +163,15 @@ impl App {
         }
         let path_and_query = uri.path_and_query().map_or("/", |p| p.as_str());
         let host = self.config.origin.host_str().unwrap_or_default();
-        crate::nostr::verify_nip98(header, method.as_str(), path_and_query, body, host, crate::util::now())
-            .map_err(|message| ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid_authorization", message))
+        let now = crate::util::now();
+        let refuse = |message: String| ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid_authorization", message);
+        let event = crate::nostr::verify_nip98(header, method.as_str(), path_and_query, body, host, now).map_err(refuse)?;
+        // A replayed read shows nothing the response it copied didn't, so
+        // only requests that change something are held to one use each.
+        if !matches!(*method, Method::GET | Method::HEAD) && !self.seen_auth.lock().first_sight(&event.sig, now) {
+            return Err(refuse("This authorization has already been used. Sign each request afresh.".into()));
+        }
+        Ok(event.pubkey)
     }
 
     /// Who's paying for an inference request: an API key's owner, if it

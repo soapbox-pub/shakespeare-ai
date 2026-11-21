@@ -56,7 +56,9 @@ impl Event {
         let pubkey = hex::encode(keypair.x_only_public_key().0.serialize());
         let id = Self::compute_id(&pubkey, created_at, kind, &tags, content);
         let digest = hex::decode(&id).expect("hex");
-        let sig = SECP256K1.sign_schnorr_no_aux_rand(&digest, &keypair);
+        // Fresh randomness, as real signers use, so identical events get
+        // signatures of their own.
+        let sig = SECP256K1.sign_schnorr_with_aux_rand(&digest, &keypair, &rand::random());
         Event { id, pubkey, created_at, kind, tags, content: content.to_string(), sig: hex::encode(sig.to_byte_array()) }
     }
 }
@@ -73,7 +75,7 @@ pub const NIP98_KIND: i64 = 27235;
 pub const MAX_AUTH_AGE: i64 = 60;
 
 /// Verify an `Authorization: Nostr <base64 event>` header against a request,
-/// returning the pubkey that signed it.
+/// returning the event, whose pubkey signed it.
 ///
 /// The signed `u` tag is compared against the public origin rather than the
 /// URL this process sees, which differs behind a reverse proxy. Host, path and
@@ -83,7 +85,7 @@ pub const MAX_AUTH_AGE: i64 = 60;
 /// with one must carry it — otherwise anyone who saw the header could replay
 /// it within the window with a body of their own. Every known client
 /// (nostrify's `NIP98Client`, nostr-tools' `getToken` with a payload) sends it.
-pub fn verify_nip98(header: Option<&str>, method: &str, path_and_query: &str, body: &[u8], host: &str, now: i64) -> Result<String, String> {
+pub fn verify_nip98(header: Option<&str>, method: &str, path_and_query: &str, body: &[u8], host: &str, now: i64) -> Result<Event, String> {
     let header = header.ok_or("Missing Nostr authorization header")?;
     let token = header.strip_prefix("Nostr ").map(str::trim).filter(|t| !t.is_empty()).ok_or("Missing Nostr authorization token")?;
 
@@ -125,7 +127,7 @@ pub fn verify_nip98(header: Option<&str>, method: &str, path_and_query: &str, bo
         _ => {}
     }
 
-    Ok(event.pubkey)
+    Ok(event)
 }
 
 #[cfg(test)]
@@ -208,7 +210,7 @@ mod tests {
     const NOW: i64 = 1_800_000_000;
 
     fn check(header: &str, method: &str, path: &str, body: &[u8]) -> Result<String, String> {
-        verify_nip98(Some(header), method, path, body, "ai.example.com", NOW)
+        verify_nip98(Some(header), method, path, body, "ai.example.com", NOW).map(|event| event.pubkey)
     }
 
     #[test]
