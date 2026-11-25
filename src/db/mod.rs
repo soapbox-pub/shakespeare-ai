@@ -218,7 +218,26 @@ mod tests {
             conn.query_row("SELECT method, fee, provider_ref, completed_at FROM payments WHERE id = 'pi_1'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
         assert_eq!(row, ("lightning".into(), 1, Some("https://v".into()), Some(2)));
         let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'payments' AND name LIKE 'payments_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(indexes, 3);
+        assert_eq!(indexes, 4);
         conn.execute("INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES ('pi_2', 'a', 'bitcoin', 'pending', 1, 0, 'bitcoin:x', 1, 2)", []).unwrap();
+    }
+
+    #[test]
+    fn counts_bitcoin_indexes_on_from_the_addresses_given_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_connection(&dir.path().join("t.sqlite3")).unwrap();
+        let before = migrations::MIGRATIONS.iter().position(|(name, _)| *name == "007_payment_cleanup").unwrap();
+        apply_migrations(&mut conn, &migrations::MIGRATIONS[..before]).unwrap();
+        for (id, idx) in [("pi_1", 0), ("pi_2", 4)] {
+            conn.execute(
+                "INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES (?, 'a', 'bitcoin', 'expired', 1, 0, 'bitcoin:x', 1, 2)",
+                [id],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO bitcoin_addresses (payment_id, xpub, idx, address, sats) VALUES (?1, 'xpub1', ?2, ?1, 1)", params![id, idx]).unwrap();
+        }
+        apply_migrations(&mut conn, migrations::MIGRATIONS).unwrap();
+        crate::store::delete_expired_payments(&mut conn, 3).unwrap();
+        assert_eq!(crate::store::take_bitcoin_index(&conn, "xpub1").unwrap(), 5);
     }
 }

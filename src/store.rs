@@ -249,10 +249,19 @@ pub fn pending_lightning(conn: &Connection) -> Result<Vec<Payment>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The next unused receive address index for an account key.
-pub fn next_bitcoin_index(conn: &Connection, xpub: &str) -> Result<u32> {
-    let next: i64 = conn.query_row("SELECT COALESCE(MAX(idx) + 1, 0) FROM bitcoin_addresses WHERE xpub = ?", [xpub], |r| r.get(0))?;
-    Ok(u32::try_from(next)?)
+/// Take the next unused receive address index for an account key. Call it in
+/// the transaction that records the address, so a rollback gives it back.
+pub fn take_bitcoin_index(conn: &Connection, xpub: &str) -> Result<u32> {
+    // An account key first seen here starts past any address already
+    // recorded for it.
+    let index: i64 = conn.query_row(
+        "INSERT INTO bitcoin_accounts (xpub, next_idx) VALUES (?1, (SELECT COALESCE(MAX(idx) + 1, 0) FROM bitcoin_addresses WHERE xpub = ?1) + 1)
+         ON CONFLICT (xpub) DO UPDATE SET next_idx = next_idx + 1
+         RETURNING next_idx - 1",
+        [xpub],
+        |r| r.get(0),
+    )?;
+    Ok(u32::try_from(index)?)
 }
 
 pub fn insert_bitcoin_address(conn: &Connection, payment_id: &str, xpub: &str, index: u32, address: &str, sats: u64) -> Result<()> {
@@ -346,6 +355,26 @@ pub fn open_bitcoin_payments(conn: &Connection, pubkey: Option<&str>, now: i64) 
 /// expires with it, and a late webhook can still complete it.
 pub fn expire_stripe_payments(conn: &Connection, now: i64) -> Result<usize> {
     Ok(conn.execute("UPDATE payments SET status = 'expired' WHERE status = 'pending' AND method = 'stripe' AND expires_at <= ?", [now])?)
+}
+
+/// Delete payments that expired before `before`, unpaid: nothing was
+/// credited for them, and they're no longer watched or payable. A bitcoin
+/// payment that was sent something is kept, as the record of where that
+/// money went. Their indexes stay taken (see [`take_bitcoin_index`]).
+pub fn delete_expired_payments(conn: &mut Connection, before: i64) -> Result<usize> {
+    let tx = write_tx(conn)?;
+    tx.execute(
+        "DELETE FROM bitcoin_addresses WHERE seen = 0 AND paid IS NULL
+         AND payment_id IN (SELECT id FROM payments WHERE status = 'expired' AND expires_at < ?)",
+        [before],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM payments WHERE status = 'expired' AND expires_at < ?
+         AND NOT EXISTS (SELECT 1 FROM bitcoin_addresses b WHERE b.payment_id = payments.id)",
+        [before],
+    )?;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 // Gift cards.
@@ -967,10 +996,9 @@ mod tests {
                     expires_at,
                 };
                 insert_payment(conn, &payment)?;
-                insert_bitcoin_address(conn, id, "xpub1", next_bitcoin_index(conn, "xpub1")?, &address, 1000)?;
+                insert_bitcoin_address(conn, id, "xpub1", take_bitcoin_index(conn, "xpub1")?, &address, 1000)?;
             }
-            assert_eq!(next_bitcoin_index(conn, "xpub1")?, 3);
-            assert_eq!(next_bitcoin_index(conn, "xpub2")?, 0);
+            assert_eq!(take_bitcoin_index(conn, "xpub2")?, 0);
             // The same index can't be given out twice.
             assert!(insert_bitcoin_address(conn, "pi_1", "xpub1", 0, "bc1qother", 1).is_err());
 
@@ -989,6 +1017,50 @@ mod tests {
             assert_eq!(open_bitcoin_payments(conn, None, 0)?, 1);
             assert_eq!(open_bitcoin_payments(conn, Some("nobody"), 0)?, 0);
             assert_eq!(open_bitcoin_payments(conn, None, 100)?, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn deletes_long_expired_unpaid_payments() {
+        let t = temp_db();
+        t.db.with(|conn| {
+            pay(conn, "pi_paid", DOLLAR);
+            complete_payment(conn, "pi_paid", 1)?;
+            pay(conn, "pi_open", DOLLAR);
+            pay(conn, "pi_expired", DOLLAR);
+            expire_payment(conn, "pi_expired")?;
+            for (i, id) in ["pi_btc_sent", "pi_btc"].into_iter().enumerate() {
+                let address = format!("bc1q{i}");
+                let payment = NewPayment {
+                    id,
+                    pubkey: ALICE,
+                    method: Method::Bitcoin,
+                    amount: DOLLAR,
+                    fee: Money::ZERO,
+                    url: "bitcoin:x",
+                    provider_ref: Some(&address),
+                    created_at: 1,
+                    expires_at: 2,
+                };
+                insert_payment(conn, &payment)?;
+                insert_bitcoin_address(conn, id, "xpub1", take_bitcoin_index(conn, "xpub1")?, &address, 1000)?;
+                expire_payment(conn, id)?;
+            }
+            record_bitcoin_check(conn, "pi_btc_sent", 400, 3, 800_000)?;
+
+            // Not yet long enough past.
+            assert_eq!(delete_expired_payments(conn, 2)?, 0);
+            assert_eq!(delete_expired_payments(conn, 3)?, 2);
+            assert!(get_payment(conn, "pi_expired")?.is_none());
+            assert!(get_payment(conn, "pi_btc")?.is_none());
+            for id in ["pi_paid", "pi_open", "pi_btc_sent"] {
+                assert!(get_payment(conn, id)?.is_some(), "{id}");
+            }
+            assert_eq!(balance(conn, ALICE)?, DOLLAR);
+            // The deleted payment had the highest index, and it's never given out again.
+            assert_eq!(take_bitcoin_index(conn, "xpub1")?, 2);
             Ok(())
         })
         .unwrap();

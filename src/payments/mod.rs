@@ -34,6 +34,12 @@ const CONCURRENT_CHECKS: usize = 8;
 /// a payment sent late, or one sent in time that's slow to confirm.
 const BITCOIN_GRACE: i64 = 7 * 24 * 60 * 60;
 
+/// How long after an unpaid payment expires it's deleted: well past Stripe's
+/// last webhook retry (3 days) and [`BITCOIN_GRACE`], so nothing could still
+/// complete it.
+const EXPIRED_RETENTION: i64 = 30 * 24 * 60 * 60;
+const _: () = assert!(EXPIRED_RETENTION > BITCOIN_GRACE);
+
 /// Make a payment for `amount` of credits, plus the fee.
 pub async fn create(app: &App, pubkey: &str, amount: Money, method: Method, redirect_url: Option<&str>) -> Result<Payment> {
     let id = store::new_payment_id();
@@ -100,7 +106,7 @@ async fn create_bitcoin(app: &App, pubkey: &str, id: String, amount: Money, fee:
         .call(move |conn| {
             let tx = store::write_tx(conn)?;
             let account = wallet.id();
-            let index = store::next_bitcoin_index(&tx, &account)?;
+            let index = store::take_bitcoin_index(&tx, &account)?;
             let address = wallet.address(index)?;
             let url = bitcoin::uri(&address, sats);
             let payment =
@@ -288,7 +294,12 @@ pub async fn poll(app: Arc<App>) {
     loop {
         interval.tick().await;
         let pending = app.db.call(|conn| {
-            store::expire_stripe_payments(conn, crate::util::now())?;
+            let now = crate::util::now();
+            store::expire_stripe_payments(conn, now)?;
+            let deleted = store::delete_expired_payments(conn, now - EXPIRED_RETENTION)?;
+            if deleted > 0 {
+                crate::log::info("payments.deleted", serde_json::json!({ "count": deleted }));
+            }
             store::pending_lightning(conn)
         });
         let pending = match pending.await {

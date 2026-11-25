@@ -49,6 +49,10 @@ as well (see below), since accounts are free to make. Pending
 payments are checked on 8 at a time, and a provider that takes more than 15
 seconds to answer is given up on until the next poll.
 
+A payment that expires unpaid is deleted 30 days later, by which time nothing
+can still complete it, so expired payments don't pile up. A bitcoin payment
+that was sent something is kept, as the record of where that money went.
+
 ## Dashboard
 
 The site at `/` is a dashboard (`dashboard/`, React and Vite, started from
@@ -210,6 +214,8 @@ mempool, where a payment can still be double-spent).
   Settings → Gap limit) well past `max_pending`, or the wallet won't show
   some payments. (The service still credits them.)
 - Indexes are counted per account key, so changing the key starts again at 0.
+  An index stays used after its payment is deleted, so no address is given
+  out twice.
 - Don't use the key for anything else that hands out receive addresses, or
   the two will reuse each other's.
 

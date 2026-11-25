@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -213,4 +213,19 @@ ALTER TABLE bitcoin_addresses ADD COLUMN checked_height INTEGER;
 ALTER TABLE bitcoin_addresses ADD COLUMN paid INTEGER;
 
 CREATE INDEX payments_open ON payments (method, status, expires_at, pubkey);
+"#;
+
+/// Expired payments are deleted once they're long past, so bitcoin indexes
+/// are counted apart from the addresses that used them.
+const PAYMENT_CLEANUP: &str = r#"
+-- The next receive address index for each account key. Never goes down, so
+-- an address whose payment was deleted is never given out again.
+CREATE TABLE bitcoin_accounts (
+    xpub TEXT PRIMARY KEY,
+    next_idx INTEGER NOT NULL CHECK (next_idx >= 0)
+) STRICT;
+
+INSERT INTO bitcoin_accounts (xpub, next_idx) SELECT xpub, MAX(idx) + 1 FROM bitcoin_addresses GROUP BY xpub;
+
+CREATE INDEX payments_expired ON payments (expires_at) WHERE status = 'expired';
 "#;
