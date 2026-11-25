@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use super::upstream::{self, upstream_failure};
 use super::ApiError;
 use crate::app::App;
-use crate::config::{ImagePrice, Kind};
+use crate::config::{ImagePrice, ImageTokens, Kind};
 use crate::money::Money;
 use crate::store::{self, Generation};
 
@@ -75,11 +75,17 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     .await?;
     let mut result: Value = response.json().await.map_err(|e| upstream_failure(&e.to_string()))?;
 
-    // Charge for what was made, as the provider describes it.
+    // Charge for what was made, as the provider describes it: by the tokens
+    // it used, where the model is priced that way and it says, or else by the
+    // image, at the quality and size it made.
     let made = result.get("data").and_then(Value::as_array).map_or(n, |d| d.len() as u32);
     let quality = result.get("quality").and_then(Value::as_str).filter(|q| QUALITIES.contains(q)).or(params.quality.as_deref()).unwrap_or("high");
     let size = result.get("size").and_then(Value::as_str).or(params.size.as_deref());
-    let cost = per_image(price, quality, size).checked_mul(i64::from(made)).unwrap_or(Money(i64::MAX));
+    let tokens = price.tokens.as_ref().and_then(|rates| Some((rates, image_tokens(result.get("usage")?)?)));
+    let cost = match tokens {
+        Some((rates, tokens)) => rates.cost(tokens),
+        None => per_image(price, quality, size).checked_mul(i64::from(made)).unwrap_or(Money(i64::MAX)),
+    };
 
     let created_at = crate::util::now();
     let generation = Generation {
@@ -88,9 +94,10 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         pubkey: pubkey.clone(),
         model: params.model.clone(),
         created_at,
-        prompt_tokens: 0,
-        // Images, counted as completion tokens, as they always have been.
-        completion_tokens: u64::from(made),
+        prompt_tokens: tokens.map_or(0, |(_, t)| t.text_input + t.image_input),
+        // Images, counted as completion tokens, as they always have been,
+        // unless the provider counted its tokens.
+        completion_tokens: tokens.map_or(u64::from(made), |(_, t)| t.output),
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         cost,
@@ -102,7 +109,11 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     let id = generation.id.clone();
     app.metrics.usage(&params.model, 0, u64::from(made), cost);
     let recorded = app.db.call(move |conn| store::record_generation(conn, &generation)).await;
-    let fields = json!({ "pubkey": pubkey, "api_key": caller.api_key_id(), "model": params.model, "cost": cost.to_f64(), "upstream": upstream.label(), "images": made, "quality": quality, "size": size, "id": id });
+    let fields = json!({
+        "pubkey": pubkey, "api_key": caller.api_key_id(), "model": params.model, "cost": cost.to_f64(), "upstream": upstream.label(),
+        "images": made, "quality": result.get("quality").and_then(Value::as_str).unwrap_or(quality), "size": size,
+        "output_tokens": tokens.map(|(_, t)| t.output), "id": id,
+    });
     match recorded {
         Ok(()) => crate::log::info("image.generation", fields),
         Err(error) => crate::log::error("image.unrecorded", json!({ "generation": fields, "error": format!("{error:#}") })),
@@ -113,6 +124,17 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         "data": result.get_mut("data").map(Value::take),
         "usage": { "prompt_tokens": 0, "completion_tokens": made, "total_tokens": made, "cost": cost.to_f64() },
     })))
+}
+
+/// What an image request used, from OpenAI's `usage`: input split into text
+/// and images (an edit's), and output. Input without a split is all text.
+fn image_tokens(usage: &Value) -> Option<ImageTokens> {
+    let count = |path: &str| usage.pointer(path).and_then(Value::as_u64);
+    let output = count("/output_tokens")?;
+    let input = count("/input_tokens").unwrap_or(0);
+    let image_input = count("/input_tokens_details/image_tokens").unwrap_or(0);
+    let text_input = count("/input_tokens_details/text_tokens").unwrap_or(input.saturating_sub(image_input));
+    Some(ImageTokens { text_input, image_input, output })
 }
 
 /// One image's price. Anything but a square costs as a wide one, `auto`

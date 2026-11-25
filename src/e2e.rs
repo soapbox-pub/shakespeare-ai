@@ -63,6 +63,14 @@ async fn fake_upstream() -> String {
     }
     async fn images(body: Bytes) -> axum::Json<Value> {
         let request: Value = serde_json::from_slice(&body).unwrap();
+        if request["model"] == "gpt-image-tokens" {
+            // As GPT Image 2 and later do: a quality of its own choosing, and
+            // what it used.
+            return axum::Json(json!({
+                "created": 1, "quality": "xhigh", "size": "2048x2048", "data": [{"b64_json": "x"}],
+                "usage": { "input_tokens": 1000, "input_tokens_details": { "text_tokens": 1000, "image_tokens": 0 }, "output_tokens": 10_000 },
+            }));
+        }
         assert_eq!(request["model"], "gpt-image-1");
         axum::Json(json!({ "created": 1, "quality": "medium", "size": "1024x1024", "data": [{"b64_json": "x"}, {"b64_json": "y"}] }))
     }
@@ -212,6 +220,15 @@ models:
       low: {{ square: 0.011, wide: 0.016 }}
       medium: {{ square: 0.042, wide: 0.063 }}
       high: {{ square: 0.167, wide: 0.25 }}
+  gpt-image-tokens:
+    type: image
+    hidden: true
+    upstreams: [fake/gpt-image-tokens]
+    price:
+      low: {{ square: 0.025, wide: 0.02 }}
+      medium: {{ square: 0.044, wide: 0.035 }}
+      high: {{ square: 0.053, wide: 0.042 }}
+      tokens: {{ text_input: 5, image_input: 8, output: 30 }}
 "#
     );
     let t = temp_db();
@@ -526,6 +543,24 @@ async fn generates_images_priced_by_what_was_made() {
     assert_eq!(body["usage"]["cost"], 0.084);
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(balance(&app), Money(1_000_000_000 - 84_000_000));
+}
+
+#[tokio::test]
+async fn charges_token_priced_images_by_what_they_used() {
+    let (app, _t) = setup().await;
+    give_more(&app);
+    let request = signed("POST", "/v1/images/generations", Some(json!({ "model": "gpt-image-tokens", "prompt": "a cat" })));
+    let (status, body) = json_of(router(app.clone()).oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 1000 text tokens at $5/M and 10,000 out at $30/M: more than the table's
+    // dearest image, for a quality it hasn't got.
+    assert_eq!(body["usage"]["cost"], 0.305);
+    assert_eq!(balance(&app), Money(1_000_000_000 - 305_000_000));
+    let tokens = app
+        .db
+        .with(|conn| Ok(conn.query_row("SELECT prompt_tokens, completion_tokens FROM generations", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?))
+        .unwrap();
+    assert_eq!(tokens, (1000, 10_000));
 }
 
 fn give_more(app: &App) {

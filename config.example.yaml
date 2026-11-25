@@ -165,13 +165,16 @@ models:
         # params: { provider: { order: [deepinfra], allow_fallbacks: false } }
 
   # Image models are priced per image, by quality and shape, and need
-  # providers with api: openai.
-  gpt-image-1:
+  # providers with api: openai. With `tokens` (USD per million), an image is
+  # charged by the tokens the provider says it used, and the per-image table
+  # is an estimate: what's shown, and what a balance is checked against.
+  gpt-image-2.6-flare:
     type: image
-    name: GPT Image 1
-    description: Generate high-quality images from text descriptions.
+    name: GPT Image 2.6 Flare
+    description: Fast image generation, for quick iteration.
     price:
-      low: { square: 0.011, wide: 0.016 }
-      medium: { square: 0.042, wide: 0.063 }
-      high: { square: 0.167, wide: 0.25 }
-    upstreams: [openai/gpt-image-1]
+      low: { square: 0.025, wide: 0.02 }
+      medium: { square: 0.044, wide: 0.035 }
+      high: { square: 0.053, wide: 0.042 }
+      tokens: { text_input: 5, image_input: 8, output: 30 }
+    upstreams: [openai/gpt-image-2.6-flare]

@@ -95,7 +95,10 @@ YAML; see `config.example.yaml`, which documents every field. In short:
   `price` in USD per million tokens: `input`, `output`, and `cache_read` and
   `cache_write` for cached input, which default to `input`. An image model's
   `price` is per image, by quality and shape, and its upstreams must speak
-  `openai`. `hidden: true` keeps a model out of `/v1/models` while it stays
+  `openai`. With `price.tokens` (USD per million text input, image input and
+  output tokens, as OpenAI bills GPT Image 2 and later), it's charged by the
+  tokens the provider says it used, whatever quality or size it picked, and
+  the per-image table is only what's shown and checked against beforehand. `hidden: true` keeps a model out of `/v1/models` while it stays
   callable. Free chat models are always hidden.
 - **payments**: the fee (`0.1` is 10%), the minimum purchase, Stripe's keys,
   the Lightning address, and the bitcoin account key.

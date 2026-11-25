@@ -422,12 +422,50 @@ pub struct Tokens {
     pub cache_write: u64,
 }
 
+/// What an image costs. The table, per image by quality and shape, is what
+/// `/v1/models` shows and what a balance is checked against beforehand. With
+/// `tokens`, an image is charged by the tokens the provider says it used, at
+/// those rates, whatever quality or size the provider chose; the table is
+/// then only an estimate, and the charge when a response has no usage.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImagePrice {
     pub low: ImageSizes,
     pub medium: ImageSizes,
     pub high: ImageSizes,
+    #[serde(default)]
+    pub tokens: Option<ImageTokenPrice>,
+}
+
+/// USD per million tokens, as OpenAI bills GPT Image 2 and later.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageTokenPrice {
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub text_input: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub image_input: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub output: Decimal,
+}
+
+/// An image request's usage, as OpenAI reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageTokens {
+    pub text_input: u64,
+    pub image_input: u64,
+    pub output: u64,
+}
+
+impl ImageTokenPrice {
+    pub fn cost(&self, tokens: ImageTokens) -> Money {
+        let dollars = [(self.text_input, tokens.text_input), (self.image_input, tokens.image_input), (self.output, tokens.output)]
+            .into_iter()
+            .map(|(price, n)| price * Decimal::from(n))
+            .sum::<Decimal>()
+            / Decimal::from(1_000_000);
+        Money::from_dollars(dollars).unwrap_or(Money(i64::MAX))
+    }
 }
 
 #[derive(Debug, Deserialize)]
