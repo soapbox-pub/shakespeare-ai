@@ -637,7 +637,9 @@ mod tests {
         // A million in: half read from the cache, a quarter written to it.
         let cached = Tokens { input: 1_000_000, cache_read: 500_000, cache_write: 250_000, output: 0 };
         assert_eq!(price.cost(cached), Money(750_000_000 + 150_000_000 + 937_500_000));
-        assert!(matches!(config.models["gpt-image-1"].kind, Kind::Image { .. }));
+        let Kind::Image { price } = &config.models["gpt-image-2.6-flare"].kind else { panic!() };
+        let tokens = ImageTokens { text_input: 1000, image_input: 0, output: 1000 };
+        assert_eq!(price.tokens.as_ref().unwrap().cost(tokens), Money(35_000_000));
         let gemma = &config.models["gemma-4-26b"];
         assert_eq!(gemma.upstreams[0].label(), "openrouter/google/gemma-4-26b-a4b-it");
         assert!(gemma.is_free_chat());
