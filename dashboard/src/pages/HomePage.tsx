@@ -14,9 +14,9 @@ import { useModels, usePaymentMethods } from '@/hooks/useCredits';
 import type { Model, PaymentMethod } from '@/lib/api';
 import { perMillion, price } from '@/lib/format';
 
-const METHOD_NAMES: Record<PaymentMethod, string> = { stripe: 'card', lightning: 'Lightning', bitcoin: 'bitcoin' };
+const METHOD_NAMES: Record<PaymentMethod, string> = { stripe: 'card', lightning: 'Lightning', bitcoin: 'bitcoin', monero: 'monero' };
 
-/** "card, Lightning or bitcoin", for the methods this server takes. */
+/** "card, Lightning, bitcoin or monero", for the methods this server takes. */
 function methodList(methods: PaymentMethod[]): string {
   const names = methods.map((m) => METHOD_NAMES[m]).filter(Boolean);
   return names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : (names[0] ?? '');

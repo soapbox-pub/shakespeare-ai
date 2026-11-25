@@ -189,8 +189,8 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
             <h3>Get Credit Balance</h3>
             <Endpoint method="GET" path="/v1/credits" />
             <p>
-              Retrieves the user's current credit balance. <code>pending</code> is credit on its way: bitcoin that's been
-              sent, the mempool included, but isn't yet confirmed deep enough to credit. <code>advanced</code> is the part of
+              Retrieves the user's current credit balance. <code>pending</code> is credit on its way: bitcoin or monero
+              that's been sent, the mempool included, but isn't yet confirmed deep enough to credit. <code>advanced</code> is the part of
               it that can be spent already (see below); spending it can take <code>amount</code> below zero until the
               payment confirms.
             </p>
@@ -207,8 +207,8 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
             <p>
               Lists the payment methods this server accepts, with the minimum purchase in dollars and the fee charged on top
               (<code>0.1</code> is 10%). It needs no authentication. Only <code>stripe</code> takes a{' '}
-              <code>redirect_url</code>; <code>bitcoin</code> says how many confirmations a payment needs before it's
-              credited.
+              <code>redirect_url</code>; <code>bitcoin</code> and <code>monero</code> say how many confirmations a payment
+              needs before it's credited.
             </p>
             <h4>Response</h4>
             <Code>{`{
@@ -216,7 +216,8 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
   "data": [
     { "object": "payment_method", "id": "stripe", "requires_redirect_url": true },
     { "object": "payment_method", "id": "lightning" },
-    { "object": "payment_method", "id": "bitcoin", "confirmations": 1 }
+    { "object": "payment_method", "id": "bitcoin", "confirmations": 1 },
+    { "object": "payment_method", "id": "monero", "confirmations": 1 }
   ],
   "has_more": false,
   "minimum_amount": 5,
@@ -225,7 +226,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
 
             <h3>Add Credits</h3>
             <Endpoint method="POST" path="/v1/credits/add" />
-            <p>Initiates a payment to add credits to the user's account. Supports Stripe, Lightning Network and onchain Bitcoin payments.</p>
+            <p>Initiates a payment to add credits to the user's account. Supports Stripe, Lightning Network, onchain Bitcoin and Monero payments.</p>
             <h4>Request Body (Stripe)</h4>
             <Code>{`{
   "amount": 10.00,
@@ -242,6 +243,11 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
   "amount": 10.00,
   "method": "bitcoin"
 }`}</Code>
+            <h4>Request Body (Monero)</h4>
+            <Code>{`{
+  "amount": 10.00,
+  "method": "monero"
+}`}</Code>
             <p>
               A Lightning payment's <code>url</code> is a bolt11 invoice. A Bitcoin payment's is a BIP21 URI with a fresh
               address and the amount, such as <code>bitcoin:bc1q...?amount=0.00011</code>; it completes once the transaction
@@ -257,6 +263,14 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
               <code>bitcoin.advanced</code>. A new account always waits for the confirmation. If an advanced payment's
               transaction is replaced or dropped, or never confirms, the advance is taken back, whatever was spent of it is
               owed, and the account isn't advanced anything again.
+            </p>
+            <p>
+              A Monero payment's <code>url</code> is a <code>monero:</code> URI with a fresh subaddress and the amount, such
+              as <code>monero:8...?tx_amount=0.0275</code>. It's credited as a Bitcoin payment is: once the transaction
+              confirms, for what was sent, and an account may have 3 open at once. It has <code>monero</code>: the{' '}
+              <code>piconero</code> it asks for (a monero is 10<sup>12</sup>), and the piconero <code>received</code> so
+              far, the mempool included. Money sent locked until a later block isn't counted. Nothing is spendable before
+              a Monero payment confirms.
             </p>
             <h4>Response</h4>
             <Code>{`{
@@ -277,7 +291,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
             <Endpoint method="GET" path="/v1/credits/payments/{payment_id}" />
             <p>
               Checks the status of a payment. Payments are completed automatically once paid: by Stripe's webhook, or by
-              checking the Lightning invoice or the Bitcoin address.
+              checking the Lightning invoice or the Bitcoin or Monero address.
             </p>
 
             <h3>List Payments</h3>
@@ -290,7 +304,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
                 ['limit', 'integer', 'Maximum number of payments to return (default: 20, max: 100)'],
                 ['starting_after', 'string', 'Payment ID for pagination'],
                 ['status', 'string', 'Filter by status: pending, completed, failed, expired'],
-                ['method', 'string', 'Filter by method: stripe, lightning, bitcoin'],
+                ['method', 'string', 'Filter by method: stripe, lightning, bitcoin, monero'],
               ]}
             />
           </DocSection>

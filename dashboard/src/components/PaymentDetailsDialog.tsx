@@ -5,14 +5,14 @@ import { CopyField } from '@/components/CopyField';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { isConfirming, isUnsettled, METHOD_LABELS, type Payment, PAYMENT_STATUS } from '@/lib/api';
+import { coinAmount, isConfirming, isUnsettled, METHOD_LABELS, onchain, type Payment, PAYMENT_STATUS } from '@/lib/api';
 import { dateTime, usd } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
 interface PaymentDetailsDialogProps {
   payment?: Payment;
   onOpenChange: (open: boolean) => void;
-  /** Pick up a payment that's still open, or watch bitcoin that's confirming. */
+  /** Pick up a payment that's still open, or watch bitcoin or monero that's confirming. */
   onResume: (payment: Payment) => void;
 }
 
@@ -30,8 +30,11 @@ export function PaymentDetailsDialog({ payment, onOpenChange, onResume }: Paymen
 function Details({ payment, onResume }: { payment: Payment; onResume: (payment: Payment) => void }) {
   const confirming = isConfirming(payment);
   const status = PAYMENT_STATUS[payment.status];
-  const address = payment.method === 'bitcoin' ? bitcoinAddress(payment.url) : undefined;
-  const sats = payment.bitcoin;
+  const chain = onchain(payment);
+  const address = chain ? uriAddress(payment.url) : undefined;
+  // Sats, or monero.
+  const units = (n: number) => (chain?.coin === 'BTC' ? n.toLocaleString() : coinAmount('XMR', n));
+  const unit = chain?.coin === 'BTC' ? 'Sats' : 'XMR';
 
   return (
     <>
@@ -68,11 +71,11 @@ function Details({ payment, onResume }: { payment: Payment; onResume: (payment: 
           ) : (
             <Row label={payment.status === 'expired' ? 'Expired' : 'Expires'}>{dateTime(payment.expires_at)}</Row>
           )}
-          {sats && (
+          {chain && (
             <>
-              <Row label="Sats asked for">{sats.sats.toLocaleString()}</Row>
-              <Row label="Sats received">{sats.received.toLocaleString()}</Row>
-              {sats.advanced ? <Row label="Spendable before confirming">{usd(sats.advanced)}</Row> : null}
+              <Row label={`${unit} asked for`}>{units(chain.asked)}</Row>
+              <Row label={`${unit} received`}>{units(chain.received)}</Row>
+              {chain.advanced ? <Row label="Spendable before confirming">{usd(chain.advanced)}</Row> : null}
             </>
           )}
           {payment.description && <Row label="Description">{payment.description}</Row>}
@@ -103,8 +106,8 @@ function Details({ payment, onResume }: { payment: Payment; onResume: (payment: 
   );
 }
 
-/** The address in a BIP21 `bitcoin:` URI. */
-function bitcoinAddress(uri: string): string | undefined {
+/** The address in a BIP21 `bitcoin:` URI, or a `monero:` one. */
+function uriAddress(uri: string): string | undefined {
   try {
     return new URL(uri).pathname || undefined;
   } catch {

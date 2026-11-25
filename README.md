@@ -1,7 +1,8 @@
 # Shakespeare AI
 
 An OpenAI-compatible AI provider that authenticates with Nostr (NIP-98), and
-bills prepaid credits bought by card (Stripe), Lightning or onchain bitcoin.
+bills prepaid credits bought by card (Stripe), Lightning, onchain bitcoin or
+Monero.
 It serves `https://ai.shakespeare.diy/v1`. API keys made with NIP-98 let any
 OpenAI client use it with just a base URL and a key.
 
@@ -43,15 +44,17 @@ Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
 - `import-legacy DIR`: import the old service's database (see below).
 
 An account may start 10 payments an hour, and an IP 30 (an IPv6 one counted
-by its /64), since each is a Stripe session, an invoice, or a bitcoin address
-watched for a week. Bitcoin payments are capped by how many are open at once
-as well (see below), since accounts are free to make. Pending
+by its /64), since each is a Stripe session, an invoice, or a bitcoin or
+monero address watched for a week. Bitcoin and monero payments are capped by
+how many are open at once as well (see below), since accounts are free to
+make. Pending
 payments are checked on 8 at a time, and a provider that takes more than 15
 seconds to answer is given up on until the next poll.
 
 A payment that expires unpaid is deleted 30 days later, by which time nothing
-can still complete it, so expired payments don't pile up. A bitcoin payment
-that was sent something is kept, as the record of where that money went.
+can still complete it, so expired payments don't pile up. A bitcoin or monero
+payment that was sent something is kept, as the record of where that money
+went.
 
 ## Dashboard
 
@@ -107,7 +110,8 @@ YAML; see `config.example.yaml`, which documents every field. In short:
   the per-image table is only what's shown and checked against beforehand. `hidden: true` keeps a model out of `/v1/models` while it stays
   callable. Free chat models are always hidden.
 - **payments**: the fee (`0.1` is 10%), the minimum purchase, Stripe's keys,
-  the Lightning address, and the bitcoin account key.
+  the Lightning address, the bitcoin account key, and the Monero wallet's
+  RPC.
 
 Any secret may be `${ENV_VAR}`. Unknown fields are errors, so typos don't pass
 silently.
@@ -241,6 +245,52 @@ mempool, where a payment can still be double-spent).
 - Don't use the key for anything else that hands out receive addresses, or
   the two will reuse each other's.
 
+## Monero
+
+Each payment gets a fresh subaddress from a view-only wallet open in
+`monero-wallet-rpc` (`wallet_rpc`), in its first account: `create_address`,
+labelled with the payment's id. The wallet has the view key, not the spend
+key, so it sees money arrive and can't move it; the money is spent from the
+wallet the key came from. The payment's `url` is a `monero:` URI with
+`tx_amount`, for a QR code.
+
+Monero hides who's paid whom, so there's no public API to ask what an address
+received, as Esplora answers for bitcoin: only a wallet holding the view key
+can tell, by scanning every block. So `monero-wallet-rpc` runs against our own
+`monerod`, and its answers decide what's credited; never point it at a node
+you don't trust, which could show it a payment that isn't in the chain. Its
+`--rpc-login` is given as `username` and `password`, and answered with HTTP
+digest auth.
+
+It's credited as bitcoin is: the piconero asked for are fixed when the
+payment is made (at Kraken's rate, else CoinGecko's, rounded up to a
+hundred-millionth of a monero), what's paid is what's credited, a payment
+stays payable for a day and is watched for a week after, an account may have
+3 open at once and everyone together `max_pending`, and a transaction counts
+once it's `confirmations` deep (1 by default; 0 counts the mempool). Where it
+differs:
+
+- The wallet has already scanned every block, so each poll is one
+  `get_transfers` for every watched subaddress, rather than a schedule of
+  checks. Asking for a payment checks its subaddress then, at most every 10
+  seconds, so the dashboard sees money reach the mempool at once.
+- Nothing is advanced before confirmation: a block comes every two minutes.
+  But a completed monero payment counts as paid before, toward an account's
+  bitcoin advances, as Lightning does: it can't be charged back.
+- Money sent locked until a later block or time (`unlock_time`), which
+  wallets don't do but anyone can, isn't counted: it couldn't be spent. It's
+  logged as `payments.monero.locked`. Nor is a mempool transaction the wallet
+  has seen double-spent.
+- Indexes come from the wallet, which hands them out in order, and are
+  counted per wallet (by its primary address) here too. A wallet made again
+  from its keys starts over at 1, so if it gives an index already given out,
+  it's moved on past them. Index 0, the primary address, is never given out.
+  Payments to a wallet that's since been replaced in the config aren't
+  checked (`payments.monero` logs how many).
+- The wallet the money's spent from sees only the subaddresses it looks
+  ahead to (Feather and the GUI: 200 by default). Raise its lookahead well
+  past `max_pending` too.
+
 ## API keys
 
 `POST /v1/keys` makes a key (`sk-shakespeare-…`) for whoever signed the
@@ -301,7 +351,8 @@ SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
 - `payments`, `giftcards` and `generations` are the records behind the
   entries. A generation keeps its tokens (with the cached input among them),
   its cost, the upstream that served it and, if known, what that cost us. `bitcoin_addresses` holds each bitcoin payment's address, its
-  derivation index and the sats it's owed.
+  derivation index and the sats it's owed; `monero_addresses` each monero
+  payment's subaddress, its index and the piconero it's owed.
 - `api_keys` holds each key's hash, owner, limit and state. A key's spend is
   the sum of its generations' costs, so there's no counter to drift.
 - `holds` is the credit set aside for requests in flight. Holds aren't

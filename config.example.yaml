@@ -56,6 +56,19 @@ payments:
       max_advance: 50
       ratio: 0.5
       max_total: 500
+  monero:
+    # monero-wallet-rpc with a view-only wallet open, on our own node: it
+    # scans the chain with the view key, and each payment is sent to a new
+    # subaddress in its first account. Its answers decide what's credited.
+    wallet_rpc: http://monero.lan:18083/json_rpc
+    # Its --rpc-login, if it was started with one.
+    username: shakespeare
+    password: ${MONERO_WALLET_RPC_PASSWORD}
+    # How many blocks deep a payment must be before it's credited.
+    confirmations: 1
+    # The most monero payments open at once, everyone's together; each
+    # takes a subaddress. (An account may have 3.)
+    max_pending: 200
 
 # How hard to try a model's upstreams. A request falls over to the next one
 # when an upstream can't be reached, is overloaded or down (408, 429, 5xx),

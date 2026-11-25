@@ -5,7 +5,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { QRCodeCanvas } from '@/components/ui/qrcode';
 import { usePayment, usePaymentMethods } from '@/hooks/useCredits';
-import { isConfirming, type Payment } from '@/lib/api';
+import { coinAmount, coinUnits, isConfirming, type Onchain, onchain, type Payment } from '@/lib/api';
 import { usd } from '@/lib/format';
 
 /** How to pay a payment, kept up to date until it's paid or expires. */
@@ -23,11 +23,11 @@ export function PaymentView({ payment: initial }: { payment: Payment }) {
     );
   }
 
-  const bitcoin = payment.bitcoin;
+  const chain = onchain(payment);
   // Paid in full, or paid short and out of time for a top-up: all that's
   // left is for it to confirm.
-  if (bitcoin && isConfirming(payment) && (bitcoin.received >= bitcoin.sats || payment.status === 'expired')) {
-    return <Confirming payment={payment} sats={bitcoin} />;
+  if (chain && isConfirming(payment) && (chain.received >= chain.asked || payment.status === 'expired')) {
+    return <Confirming payment={payment} chain={chain} />;
   }
 
   if (payment.status === 'expired') {
@@ -36,8 +36,8 @@ export function PaymentView({ payment: initial }: { payment: Payment }) {
         <Clock className="size-12 text-muted-foreground" aria-hidden />
         <p className="text-lg font-medium">This payment expired</p>
         <p className="text-sm text-muted-foreground">
-          {payment.method === 'bitcoin'
-            ? "If you sent bitcoin to it anyway, it's still watched for a week, and credited once it confirms."
+          {chain
+            ? `If you sent ${COIN_NAMES[chain.coin]} to it anyway, it's still watched for a week, and credited once it confirms.`
             : 'Start a new one to add credits.'}
         </p>
       </div>
@@ -50,7 +50,7 @@ export function PaymentView({ payment: initial }: { payment: Payment }) {
         {usd(payment.amount)} of credits, plus a {usd(payment.fee)} fee: <span className="font-medium text-foreground">{usd(payment.total)}</span>
       </p>
       {payment.method === 'lightning' && <Lightning invoice={payment.url} />}
-      {payment.method === 'bitcoin' && <Bitcoin uri={payment.url} sats={payment.bitcoin} />}
+      {chain && <Pay uri={payment.url} chain={chain} />}
       {payment.method === 'stripe' && (
         <Button asChild className="w-full">
           <a href={payment.url}>
@@ -60,11 +60,16 @@ export function PaymentView({ payment: initial }: { payment: Payment }) {
       )}
       <p className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin" aria-hidden />
-        {payment.bitcoin?.received ? 'Waiting for the rest…' : 'Waiting for payment…'}
+        {chain?.received ? 'Waiting for the rest…' : 'Waiting for payment…'}
       </p>
     </div>
   );
 }
+
+const COIN_NAMES: Record<Onchain['coin'], string> = { BTC: 'bitcoin', XMR: 'monero' };
+
+/** The query parameter each kind of URI gives the amount in. */
+const AMOUNT_PARAMS: Record<Onchain['coin'], string> = { BTC: 'amount', XMR: 'tx_amount' };
 
 function Lightning({ invoice }: { invoice: string }) {
   const uri = `lightning:${invoice}`;
@@ -81,38 +86,36 @@ function Lightning({ invoice }: { invoice: string }) {
   );
 }
 
-/** What a bitcoin payment will credit for `received` sats: its share of what it asked for. */
-function creditFor(payment: Payment, received: number, sats: number): number {
-  return (payment.amount * received) / sats;
+/** What an onchain payment will credit for what's been sent: its share of what it asked for. */
+function creditFor(payment: Payment, chain: Onchain): number {
+  return (payment.amount * chain.received) / chain.asked;
 }
 
-const SATS = 100_000_000;
-
-function Confirming({ payment, sats }: { payment: Payment; sats: NonNullable<Payment['bitcoin']> }) {
+function Confirming({ payment, chain }: { payment: Payment; chain: Onchain }) {
   const methods = usePaymentMethods();
-  const confirmations = methods.data?.data.find((m) => m.id === 'bitcoin')?.confirmations ?? 1;
+  const confirmations = methods.data?.data.find((m) => m.id === payment.method)?.confirmations ?? 1;
   const address = new URL(payment.url).pathname;
-  const short = sats.received < sats.sats;
+  const short = chain.received < chain.asked;
+  const wait = chain.coin === 'XMR' ? 'usually within a few minutes' : 'usually within an hour, or longer if the fee was low';
   return (
     <div className="flex flex-col items-center gap-3 py-6 text-center">
       <Hourglass className="size-12 text-brand motion-safe:animate-pulse" aria-hidden />
       <p className="text-lg font-medium">Payment received</p>
       <p className="text-sm text-muted-foreground">
-        <span className="font-medium text-foreground">{usd(creditFor(payment, sats.received, sats.sats))}</span> is on its way
-        to your balance. It's added once the transaction has{' '}
-        {confirmations === 1 ? 'a confirmation' : `${confirmations} confirmations`}, usually within an hour, or longer if
-        the fee was low. You can close this; it's added on its own.
+        <span className="font-medium text-foreground">{usd(creditFor(payment, chain))}</span> is on its way to your
+        balance. It's added once the transaction has {confirmations === 1 ? 'a confirmation' : `${confirmations} confirmations`},{' '}
+        {wait}. You can close this; it's added on its own.
       </p>
-      {sats.advanced ? (
+      {chain.advanced ? (
         <p className="text-sm text-muted-foreground">
           Since you've paid before, you can spend{' '}
-          <span className="font-medium text-foreground">{usd(sats.advanced)}</span> of it now.
+          <span className="font-medium text-foreground">{usd(chain.advanced)}</span> of it now.
         </p>
       ) : null}
       {short && (
         <p className="text-sm text-muted-foreground">
-          {sats.received.toLocaleString()} of the {sats.sats.toLocaleString()} sats asked for arrived, so it's credited for
-          what was sent.
+          {coinUnits(chain.coin, chain.received)} of the {coinUnits(chain.coin, chain.asked)} asked for arrived, so it's
+          credited for what was sent.
         </p>
       )}
       {address.startsWith('bc1') && (
@@ -126,24 +129,26 @@ function Confirming({ payment, sats }: { payment: Payment; sats: NonNullable<Pay
   );
 }
 
-function Bitcoin({ uri, sats }: { uri: string; sats?: Payment['bitcoin'] }) {
+/** Pay a bitcoin or monero payment: a QR code of its URI, and its address and amount to copy. */
+function Pay({ uri, chain }: { uri: string; chain: Onchain }) {
   const parsed = new URL(uri);
   const address = parsed.pathname;
+  const param = AMOUNT_PARAMS[chain.coin];
   // Paid short: ask for the rest.
-  const rest = sats && sats.received > 0 && sats.received < sats.sats ? sats.sats - sats.received : undefined;
-  const amount = rest ? (rest / SATS).toFixed(8).replace(/\.?0+$/, '') : parsed.searchParams.get('amount');
-  const href = rest ? uri.replace(/([?&]amount=)[^&]*/, `$1${amount}`) : uri;
+  const rest = chain.received > 0 && chain.received < chain.asked ? chain.asked - chain.received : undefined;
+  const amount = rest ? coinAmount(chain.coin, rest) : parsed.searchParams.get(param);
+  const href = rest ? uri.replace(new RegExp(`([?&]${param}=)[^&]*`), `$1${amount}`) : uri;
   return (
     <div className="space-y-3">
       <a href={href} className="mx-auto block w-fit rounded-lg bg-white p-2" aria-label="Open the payment in your wallet">
         <QRCodeCanvas value={href} size={240} />
       </a>
       <CopyField label="Address" value={address} />
-      {amount && <CopyField label={rest ? 'Still to send (BTC)' : 'Amount (BTC)'} value={amount} />}
+      {amount && <CopyField label={rest ? `Still to send (${chain.coin})` : `Amount (${chain.coin})`} value={amount} />}
       <Alert>
         <AlertDescription>
           {rest
-            ? `${sats!.received.toLocaleString()} of ${sats!.sats.toLocaleString()} sats have arrived. Send the rest before the payment expires, or it's credited for what was sent.`
+            ? `${coinUnits(chain.coin, chain.received)} of ${coinUnits(chain.coin, chain.asked)} have arrived. Send the rest before the payment expires, or it's credited for what was sent.`
             : 'Send exactly this amount, in one transaction. Paying less adds less credit, and paying more adds more.'}
         </AlertDescription>
       </Alert>

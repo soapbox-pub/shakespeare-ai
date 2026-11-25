@@ -16,6 +16,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 hmac = "0.12"
 indexmap = { version = "2", features = ["serde"] }
+md-5 = "0.10"
 parking_lot = "0.12"
 percent-encoding = "2"
 rand = "0.8"

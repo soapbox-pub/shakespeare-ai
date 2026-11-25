@@ -3,11 +3,11 @@ import type { NostrSigner } from '@nostrify/nostrify';
 /** NIP-98 HTTP auth event kind. */
 const NIP98_KIND = 27235;
 
-export type PaymentMethod = 'stripe' | 'lightning' | 'bitcoin';
+export type PaymentMethod = 'stripe' | 'lightning' | 'bitcoin' | 'monero';
 
 /** What credits can be bought with here, and on what terms. */
 export interface PaymentMethods {
-  /** `confirmations`, for bitcoin: how deep a payment must be to be credited. */
+  /** `confirmations`, for bitcoin and monero: how deep a payment must be to be credited. */
   data: { id: PaymentMethod; confirmations?: number }[];
   minimum_amount: number;
   /** A fraction: 0.1 is 10%. */
@@ -22,7 +22,7 @@ export interface Payment {
   total: number;
   method: PaymentMethod;
   description: string;
-  /** Stripe's checkout page, a BOLT11 invoice, or a BIP21 `bitcoin:` URI. */
+  /** Stripe's checkout page, a BOLT11 invoice, a BIP21 `bitcoin:` URI, or a `monero:` URI. */
   url: string;
   created_at: number;
   completed_at?: number;
@@ -32,11 +32,13 @@ export interface Payment {
    * account that's paid before, the credit it can already spend while that confirms.
    */
   bitcoin?: { sats: number; received: number; advanced?: number };
+  /** A monero payment's piconero: what it asks for, and what's been sent so far, the mempool included. */
+  monero?: { piconero: number; received: number };
 }
 
 /**
- * The balance, and credit on its way: bitcoin that's been sent but isn't confirmed yet, of which `advanced` can
- * be spent already.
+ * The balance, and credit on its way: bitcoin or monero that's been sent but isn't confirmed yet, of which
+ * `advanced` can be spent already.
  */
 export interface Credits {
   amount: number;
@@ -44,12 +46,47 @@ export interface Credits {
   advanced?: number;
 }
 
-/** Whether a bitcoin payment has been sent money that's waiting to confirm. */
-export function isConfirming(payment: Payment): boolean {
-  return payment.method === 'bitcoin' && payment.status !== 'completed' && (payment.bitcoin?.received ?? 0) > 0;
+/**
+ * What an onchain (bitcoin or monero) payment asks for and has been sent, in its coin's smallest unit: sats, or
+ * piconero. `advanced` is bitcoin's alone.
+ */
+export interface Onchain {
+  coin: 'BTC' | 'XMR';
+  asked: number;
+  received: number;
+  advanced?: number;
 }
 
-/** Whether a payment can still change: one that's open, or sent bitcoin that's still confirming. */
+export function onchain(payment: Payment): Onchain | undefined {
+  if (payment.bitcoin) {
+    const { sats, received, advanced } = payment.bitcoin;
+    return { coin: 'BTC', asked: sats, received, advanced };
+  }
+  if (payment.monero) {
+    return { coin: 'XMR', asked: payment.monero.piconero, received: payment.monero.received };
+  }
+  return undefined;
+}
+
+/** Decimal places in a coin: its smallest unit. */
+const DECIMALS: Record<Onchain['coin'], number> = { BTC: 8, XMR: 12 };
+
+/** An amount in a coin's smallest unit, written in the coin, without trailing zeros: `0.00011`. */
+export function coinAmount(coin: Onchain['coin'], units: number): string {
+  return (units / 10 ** DECIMALS[coin]).toFixed(DECIMALS[coin]).replace(/\.?0+$/, '');
+}
+
+/** An amount in a coin's smallest unit, as people count it: `11,000 sats`, or `0.0275 XMR`. */
+export function coinUnits(coin: Onchain['coin'], units: number): string {
+  return coin === 'BTC' ? `${units.toLocaleString()} sats` : `${coinAmount(coin, units)} XMR`;
+}
+
+/** Whether a bitcoin or monero payment has been sent money that's waiting to confirm. */
+export function isConfirming(payment: Payment): boolean {
+  return payment.status !== 'completed' && (onchain(payment)?.received ?? 0) > 0;
+}
+
+/** Whether a payment can still change: one that's open, or sent bitcoin or monero that's still confirming. */
 export function isUnsettled(payment: Payment): boolean {
   return payment.status === 'pending' || isConfirming(payment);
 }
@@ -60,7 +97,7 @@ export const PAYMENT_STATUS: Record<Payment['status'], { label: string; variant:
   expired: { label: 'Expired', variant: 'outline' },
 };
 
-export const METHOD_LABELS: Record<PaymentMethod, string> = { stripe: 'Card', lightning: 'Lightning', bitcoin: 'Bitcoin' };
+export const METHOD_LABELS: Record<PaymentMethod, string> = { stripe: 'Card', lightning: 'Lightning', bitcoin: 'Bitcoin', monero: 'Monero' };
 
 export interface Generation {
   id: string;

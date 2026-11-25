@@ -90,21 +90,22 @@ export function usePayment(id: string | undefined, method: PaymentMethod | undef
     queryFn: async () => {
       const last = queryClient.getQueryData<Payment>(['payment', pubkey, id]);
       const payment = await api!.payment(id!);
-      // Paid, expired, or sent bitcoin: the balance and history show it.
-      if (!last || payment.status !== last.status || payment.bitcoin?.received !== last.bitcoin?.received) {
+      // Paid, expired, or sent bitcoin or monero: the balance and history show it.
+      const received = (p: Payment) => p.bitcoin?.received ?? p.monero?.received;
+      if (!last || payment.status !== last.status || received(payment) !== received(last)) {
         void queryClient.invalidateQueries({ queryKey: ['balance', pubkey] });
         void queryClient.invalidateQueries({ queryKey: ['payments', pubkey] });
       }
       return payment;
     },
     enabled: !!api && !!id,
-    // Asking about a Lightning or bitcoin payment checks on it there and
-    // then (bitcoin's address at most every 10 seconds), so it's worth
-    // asking often. Stripe's is completed by its webhook.
+    // Asking about a Lightning, bitcoin or monero payment checks on it there
+    // and then (an address at most every 10 seconds), so it's worth asking
+    // often. Stripe's is completed by its webhook.
     refetchInterval: (query) => {
       const payment = query.state.data;
       if (payment && !isUnsettled(payment)) return false;
-      return method === 'lightning' ? 3_000 : method === 'bitcoin' ? 10_000 : 15_000;
+      return method === 'lightning' ? 3_000 : method === 'bitcoin' || method === 'monero' ? 10_000 : 15_000;
     },
     staleTime: 0,
   });

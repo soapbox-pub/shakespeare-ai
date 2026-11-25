@@ -37,6 +37,9 @@ pub async fn methods(State(app): State<Arc<App>>) -> Json<Value> {
     if let Some(bitcoin) = &payments.bitcoin {
         data.push(json!({ "object": "payment_method", "id": "bitcoin", "confirmations": bitcoin.confirmations }));
     }
+    if let Some(monero) = &payments.monero {
+        data.push(json!({ "object": "payment_method", "id": "monero", "confirmations": monero.confirmations }));
+    }
     let mut body = list_response(data, false, None);
     body["minimum_amount"] = payments.minimum().to_f64().into();
     body["fee"] = rust_decimal::prelude::ToPrimitive::to_f64(&payments.fee).unwrap_or_default().into();
@@ -44,12 +47,12 @@ pub async fn methods(State(app): State<Arc<App>>) -> Json<Value> {
 }
 
 /// Payments one account, or one IP, may start in an hour. Each is a Stripe
-/// session, an invoice, or a bitcoin address that's watched for a week, so
-/// they mustn't be free to make by the thousand.
+/// session, an invoice, or a bitcoin or monero address that's watched for a
+/// week, so they mustn't be free to make by the thousand.
 const PAYMENTS_PER_ACCOUNT: u32 = 10;
 const PAYMENTS_PER_IP: u32 = 30;
-/// Bitcoin payments one account may have open at once.
-const OPEN_BITCOIN_PER_ACCOUNT: u32 = 3;
+/// Bitcoin payments, or monero payments, one account may have open at once.
+const OPEN_ONCHAIN_PER_ACCOUNT: u32 = 3;
 
 pub async fn add(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
     app.limiter.check("payments", &ip, PAYMENTS_PER_IP)?;
@@ -89,30 +92,36 @@ pub async fn add(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>
         PaymentMethod::Stripe => app.config.payments.stripe.is_some(),
         PaymentMethod::Lightning => app.config.payments.lightning.is_some(),
         PaymentMethod::Bitcoin => app.config.payments.bitcoin.is_some(),
+        PaymentMethod::Monero => app.config.payments.monero.is_some(),
     };
     if !configured {
         return Err(unsupported());
     }
-    if let (PaymentMethod::Bitcoin, Some(bitcoin)) = (payment_method, &app.config.payments.bitcoin) {
+    let onchain = match payment_method {
+        PaymentMethod::Bitcoin => app.config.payments.bitcoin.as_ref().map(|b| ("bitcoin", b.max_pending)),
+        PaymentMethod::Monero => app.config.payments.monero.as_ref().map(|m| ("monero", m.max_pending)),
+        PaymentMethod::Stripe | PaymentMethod::Lightning => None,
+    };
+    if let Some((name, max_pending)) = onchain {
         let (who, now) = (pubkey.clone(), crate::util::now());
         let (mine, everyone) = app
             .db
-            .call(move |conn| Ok((store::open_bitcoin_payments(conn, Some(&who), now)?, store::open_bitcoin_payments(conn, None, now)?)))
+            .call(move |conn| Ok((store::open_payments(conn, payment_method, Some(&who), now)?, store::open_payments(conn, payment_method, None, now)?)))
             .await?;
-        if mine >= OPEN_BITCOIN_PER_ACCOUNT {
+        if mine >= OPEN_ONCHAIN_PER_ACCOUNT {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 "too_many_open_payments",
-                format!("You have {mine} bitcoin payments waiting to be paid. Pay one of them, or wait for them to expire."),
+                format!("You have {mine} {name} payments waiting to be paid. Pay one of them, or wait for them to expire."),
             ));
         }
-        if everyone >= bitcoin.max_pending {
+        if everyone >= max_pending {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
-                "bitcoin_busy",
-                "Too many bitcoin payments are waiting to be paid right now. Try again later, or pay another way.",
+                &format!("{name}_busy"),
+                format!("Too many {name} payments are waiting to be paid right now. Try again later, or pay another way."),
             ));
         }
     }
@@ -123,7 +132,7 @@ pub async fn add(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>
         Some(_) => return Err(ApiError::invalid("invalid_url", "Invalid URL").param("redirect_url")),
     };
     match (payment_method, &redirect_url) {
-        (PaymentMethod::Lightning | PaymentMethod::Bitcoin, Some(_)) => {
+        (PaymentMethod::Lightning | PaymentMethod::Bitcoin | PaymentMethod::Monero, Some(_)) => {
             return Err(ApiError::invalid("invalid_parameter_combination", "redirect_url can only be used with stripe payment method").param("redirect_url"));
         }
         (PaymentMethod::Stripe, None) => {
@@ -155,13 +164,16 @@ pub async fn get_payment(State(app): State<Arc<App>>, Path(id): Path<String>, me
 
     // Asking about a payment we check on ourselves checks on it now, rather
     // than waiting for the next poll; but not more than every few seconds.
-    // (A bitcoin one may have expired and still be paid late.)
+    // (A bitcoin or monero one may have expired and still be paid late.)
     let checked = match payment.method {
         PaymentMethod::Lightning if payment.status == "pending" && app.not_since(&payment.id, std::time::Duration::from_secs(5)) => {
             crate::payments::check_lightning(&app, &payment).await.map_err(|e| ("payments.lightning", e))
         }
         PaymentMethod::Bitcoin if payment.status != "completed" && app.not_since(&payment.id, std::time::Duration::from_secs(10)) => {
             crate::payments::check_bitcoin_now(&app, &payment.id).await.map_err(|e| ("payments.bitcoin", e))
+        }
+        PaymentMethod::Monero if payment.status != "completed" && app.not_since(&payment.id, std::time::Duration::from_secs(10)) => {
+            crate::payments::check_monero_now(&app, &payment.id).await.map_err(|e| ("payments.monero", e))
         }
         _ => return Ok(Json(tagged("payment", payment))),
     };

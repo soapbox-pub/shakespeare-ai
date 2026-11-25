@@ -2,6 +2,7 @@
 
 pub mod bitcoin;
 pub mod lightning;
+pub mod monero;
 pub mod rates;
 pub mod stripe;
 
@@ -40,6 +41,11 @@ const BITCOIN_GRACE: i64 = 7 * 24 * 60 * 60;
 const EXPIRED_RETENTION: i64 = 30 * 24 * 60 * 60;
 const _: () = assert!(EXPIRED_RETENTION > BITCOIN_GRACE);
 
+/// How long after a monero payment expires we keep watching its subaddress,
+/// as for bitcoin.
+const MONERO_GRACE: i64 = BITCOIN_GRACE;
+const _: () = assert!(EXPIRED_RETENTION > MONERO_GRACE);
+
 /// Make a payment for `amount` of credits, plus the fee.
 pub async fn create(app: &App, pubkey: &str, amount: Money, method: Method, redirect_url: Option<&str>) -> Result<Payment> {
     let id = store::new_payment_id();
@@ -48,12 +54,14 @@ pub async fn create(app: &App, pubkey: &str, amount: Money, method: Method, redi
     let fee = Money::from_dollars(amount.to_decimal() * app.config.payments.fee).unwrap_or(Money::ZERO).round_to_cents();
     let total = amount.checked_add(fee).ok_or(anyhow!("amount too large"))?;
 
-    if method == Method::Bitcoin {
-        return create_bitcoin(app, pubkey, id, amount, fee, total, created_at, expires_at).await;
+    match method {
+        Method::Bitcoin => return create_bitcoin(app, pubkey, id, amount, fee, total, created_at, expires_at).await,
+        Method::Monero => return create_monero(app, pubkey, id, amount, fee, total, created_at, expires_at).await,
+        Method::Stripe | Method::Lightning => {}
     }
 
     let (url, provider_ref) = match method {
-        Method::Bitcoin => unreachable!("handled above"),
+        Method::Bitcoin | Method::Monero => unreachable!("handled above"),
         Method::Stripe => {
             let stripe = app.config.payments.stripe.as_ref().ok_or(anyhow!("Stripe isn't configured"))?;
             let checkout = stripe::create_checkout(
@@ -117,6 +125,50 @@ async fn create_bitcoin(app: &App, pubkey: &str, id: String, amount: Money, fee:
             store::get_payment(conn, &id)?.ok_or(anyhow!("the payment vanished"))
         })
         .await
+}
+
+/// A monero payment: the wallet's next subaddress, recorded as taken in the
+/// same transaction that records the payment.
+#[allow(clippy::too_many_arguments)]
+async fn create_monero(app: &App, pubkey: &str, id: String, amount: Money, fee: Money, total: Money, created_at: i64, expires_at: i64) -> Result<Payment> {
+    let config = app.config.payments.monero.as_ref().ok_or(anyhow!("Monero isn't configured"))?;
+    let rate = app.rates.xmr_usd(&app.http).await?;
+    let piconero = usd_to_piconero(total, rate).ok_or(anyhow!("amount too large"))?;
+    let rpc = config.rpc(&app.http);
+    let account = rpc.primary_address().await.context("couldn't reach the Monero wallet")?;
+    let next = {
+        let account = account.clone();
+        app.db.call(move |conn| store::next_monero_index(conn, &account)).await?
+    };
+    let (mut index, mut address) = rpc.create_addresses(1, &id).await?.pop().ok_or(anyhow!("the Monero wallet made no subaddress"))?;
+    if index < next {
+        // The wallet is behind what's been given out: it was made again from
+        // its keys, and started over. Move it on past them, so no address is
+        // given out twice.
+        crate::log::warn("payments.monero", serde_json::json!({ "message": "the wallet's subaddresses start before ours; skipping ahead", "wallet": index, "next": next }));
+        (index, address) = rpc.create_addresses(next - index, &id).await?.pop().ok_or(anyhow!("the Monero wallet made no subaddress"))?;
+    }
+    let url = monero::uri(&address, piconero);
+    let pubkey = pubkey.to_string();
+    app.db
+        .call(move |conn| {
+            let tx = store::write_tx(conn)?;
+            let payment = NewPayment { id: &id, pubkey: &pubkey, method: Method::Monero, amount, fee, url: &url, provider_ref: Some(&address), created_at, expires_at };
+            store::insert_payment(&tx, &payment)?;
+            store::insert_monero_address(&tx, &id, &account, index, &address, piconero)?;
+            tx.commit()?;
+            store::get_payment(conn, &id)?.ok_or(anyhow!("the payment vanished"))
+        })
+        .await
+}
+
+/// Piconero for a dollar amount at `rate` dollars per monero, rounded up to
+/// a hundred-millionth of a monero, so the amount to send is short enough to
+/// read and type.
+fn usd_to_piconero(usd: Money, rate: Decimal) -> Option<u64> {
+    const STEP: u64 = monero::PICONERO / 100_000_000;
+    let steps = (usd.to_decimal() / rate * Decimal::from(100_000_000)).ceil().to_u64()?;
+    steps.checked_mul(STEP)
 }
 
 /// Whole sats for a dollar amount at `rate` dollars per bitcoin, rounded up.
@@ -346,19 +398,122 @@ pub async fn check_bitcoin_now(app: &App, id: &str) -> Result<()> {
 }
 
 /// Credits an account has on their way: what's been sent to its watched
-/// bitcoin payments but isn't yet deep enough to credit, valued as it will
-/// be credited.
+/// bitcoin and monero payments but isn't yet deep enough to credit, valued
+/// as it will be credited.
 pub async fn pending_credits(app: &App, pubkey: &str) -> Result<Money> {
-    if app.config.payments.bitcoin.is_none() {
+    let payments = &app.config.payments;
+    if payments.bitcoin.is_none() && payments.monero.is_none() {
         return Ok(Money::ZERO);
     }
     let pubkey = pubkey.to_string();
-    let watching = app.db.call(move |conn| store::bitcoin_to_watch(conn, Some(&pubkey), crate::util::now(), BITCOIN_GRACE)).await?;
+    let (bitcoin, monero) = app
+        .db
+        .call(move |conn| {
+            let now = crate::util::now();
+            Ok((store::bitcoin_to_watch(conn, Some(&pubkey), now, BITCOIN_GRACE)?, store::monero_to_watch(conn, Some(&pubkey), now, MONERO_GRACE)?))
+        })
+        .await?;
+    let bitcoin = bitcoin.iter().filter(|(_, watch)| watch.seen > 0).map(|(payment, watch)| pro_rata(payment.amount, watch.seen, watch.sats));
+    let monero = monero.iter().filter(|(_, watch)| watch.seen > 0).map(|(payment, watch)| pro_rata(payment.amount, watch.seen, watch.piconero));
     let mut total = Money::ZERO;
-    for (payment, watch) in watching.iter().filter(|(_, watch)| watch.seen > 0) {
-        total = total.checked_add(pro_rata(payment.amount, watch.seen, watch.sats)?).ok_or(anyhow!("too much pending to count"))?;
+    for pending in bitcoin.chain(monero) {
+        total = total.checked_add(pending?).ok_or(anyhow!("too much pending to count"))?;
     }
     Ok(total)
+}
+
+/// Bring a monero payment up to date with what its subaddress has been
+/// sent, and credit it for whatever's confirmed, more or less than it asked
+/// for, as [`check_bitcoin`] does: at once when it's paid in full, or once
+/// its time is up when it's paid short, as soon as what was sent has
+/// confirmed. One that's been sent nothing expires with its time. Nothing is
+/// advanced before confirmation: a monero block comes every two minutes.
+async fn check_monero(app: &App, payment: &Payment, watch: &store::MoneroWatch, received: monero::Received) -> Result<()> {
+    let now = crate::util::now();
+    if received.locked > 0 {
+        // Sent locked until later: it can't be spent, so it isn't counted.
+        crate::log::warn("payments.monero.locked", serde_json::json!({ "id": payment.id, "piconero": received.locked }));
+    }
+    let (id, seen) = (payment.id.clone(), received.seen);
+    app.db.call(move |conn| store::record_monero_check(conn, &id, seen, now)).await?;
+
+    let owed = watch.piconero;
+    let past_due = now > payment.expires_at;
+    let past_grace = now > payment.expires_at + MONERO_GRACE;
+    let settled = received.seen == received.confirmed || past_grace;
+    if received.confirmed > 0 && (received.confirmed >= owed || (past_due && settled)) {
+        let (amount, fee) = (pro_rata(payment.amount, received.confirmed, owed)?, pro_rata(payment.fee, received.confirmed, owed)?);
+        if !amount.is_positive() {
+            // Dust worth less than a nanodollar of credit.
+            return Ok(());
+        }
+        let (id, paid) = (payment.id.clone(), received.confirmed);
+        if app.db.call(move |conn| store::complete_monero_payment(conn, &id, now, amount, fee, paid)).await? {
+            let log = serde_json::json!({
+                "id": payment.id, "method": "monero", "address": payment.provider_ref, "piconero": owed, "paid": paid,
+                "credits": amount.to_f64(), "asked": payment.amount.to_f64(),
+            });
+            crate::log::info("payments.completed", log.clone());
+            if paid != owed {
+                crate::log::info(if paid > owed { "payments.monero.overpaid" } else { "payments.monero.underpaid" }, log);
+            }
+        }
+        return Ok(());
+    }
+    if payment.status == "pending" && past_due && (received.seen == 0 || past_grace) {
+        let id = payment.id.clone();
+        app.db.call(move |conn| store::expire_payment(conn, &id)).await?;
+    }
+    Ok(())
+}
+
+/// Look in on every monero payment that's waiting for money: one question to
+/// the wallet for all of them, since it's already scanned every block.
+///
+/// Only the configured wallet's subaddresses are asked about; payments made
+/// to another (if the config named a different wallet since) can't be.
+pub async fn check_monero_payments(app: &App) -> Result<()> {
+    let Some(config) = &app.config.payments.monero else { return Ok(()) };
+    let watching = app.db.call(|conn| store::monero_to_watch(conn, None, crate::util::now(), MONERO_GRACE)).await?;
+    if watching.is_empty() {
+        return Ok(());
+    }
+    let rpc = config.rpc(&app.http);
+    let account = rpc.primary_address().await.context("couldn't reach the Monero wallet")?;
+    let (ours, theirs): (Vec<_>, Vec<_>) = watching.into_iter().partition(|(_, watch)| watch.account == account);
+    if !theirs.is_empty() {
+        crate::log::warn("payments.monero", serde_json::json!({ "message": "payments to another wallet can't be checked", "count": theirs.len() }));
+    }
+    let indexes: Vec<u32> = ours.iter().map(|(_, watch)| watch.index).collect();
+    let received = rpc.received(&indexes, config.confirmations).await?;
+    futures_util::stream::iter(ours)
+        .for_each_concurrent(CONCURRENT_CHECKS, |(payment, watch)| {
+            let received = received.get(&watch.index).copied().unwrap_or_default();
+            async move {
+                if let Err(error) = check_monero(app, &payment, &watch, received).await {
+                    crate::log::warn("payments.monero", serde_json::json!({ "id": payment.id, "error": format!("{error:#}") }));
+                }
+            }
+        })
+        .await;
+    Ok(())
+}
+
+/// Look in on one monero payment now, rather than at the next poll, so money
+/// that reaches the mempool shows at once.
+pub async fn check_monero_now(app: &App, id: &str) -> Result<()> {
+    let Some(config) = &app.config.payments.monero else { return Ok(()) };
+    let id = id.to_string();
+    let Some((payment, watch)) = app.db.call(move |conn| store::monero_watch(conn, &id)).await? else { return Ok(()) };
+    if payment.status == "completed" || crate::util::now() > payment.expires_at + MONERO_GRACE {
+        return Ok(());
+    }
+    let rpc = config.rpc(&app.http);
+    if rpc.primary_address().await? != watch.account {
+        return Ok(());
+    }
+    let received = rpc.received(&[watch.index], config.confirmations).await?;
+    check_monero(app, &payment, &watch, received.get(&watch.index).copied().unwrap_or_default()).await
 }
 
 /// Take back what's advanced on payments past their [`BITCOIN_GRACE`],
@@ -404,6 +559,9 @@ pub async fn poll(app: Arc<App>) {
             .await;
         if let Err(error) = check_bitcoin_payments(&app).await {
             crate::log::warn("payments.bitcoin", serde_json::json!({ "error": format!("{error:#}") }));
+        }
+        if let Err(error) = check_monero_payments(&app).await {
+            crate::log::warn("payments.monero", serde_json::json!({ "error": format!("{error:#}") }));
         }
     }
 }
@@ -457,6 +615,16 @@ mod tests {
     }
 
     #[test]
+    fn converts_to_piconero() {
+        let ten = Money::from_dollars(Decimal::from(10)).unwrap();
+        // $10 at $400/XMR is 0.025 XMR.
+        assert_eq!(usd_to_piconero(ten, Decimal::from(400)), Some(25_000_000_000));
+        // Rounded up to a hundred-millionth of a monero.
+        assert_eq!(usd_to_piconero(ten, Decimal::from(511)), Some(19_569_480_000));
+        assert_eq!(monero::xmr(19_569_480_000).to_string(), "0.01956948");
+    }
+
+    #[test]
     fn credits_what_was_paid() {
         let ten = Money::from_dollars(Decimal::from(10)).unwrap();
         assert_eq!(pro_rata(ten, 11_000, 11_000).unwrap(), ten);
@@ -483,6 +651,7 @@ mod tests {
             pubkey: String::new(),
             provider_ref: None,
             bitcoin: None,
+            monero: None,
         };
         let checked = |at: i64, seen: u64| store::BitcoinWatch { sats: 100, seen, checked_at: Some(at), checked_height: Some(10), advanced: Money::ZERO };
         let (open, expired) = (payment("pending"), payment("expired"));

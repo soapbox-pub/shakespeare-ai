@@ -76,7 +76,7 @@ function Credits() {
               <Hourglass className="size-4 text-brand" aria-hidden />
               <span>
                 <span className="font-medium text-foreground tabular-nums">+{usd(balance.data.pending)}</span> pending, added
-                once your bitcoin confirms
+                once your payment confirms
                 {balance.data.advanced ? (
                   <>
                     . You can spend <span className="font-medium text-foreground tabular-nums">{usd(balance.data.advanced)}</span>{' '}

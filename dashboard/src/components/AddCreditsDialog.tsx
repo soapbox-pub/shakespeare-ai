@@ -1,6 +1,7 @@
 import { Bitcoin, CreditCard, Loader2, Zap } from 'lucide-react';
-import { type FormEvent, useState } from 'react';
+import { type ComponentType, type FormEvent, useState } from 'react';
 
+import { MoneroIcon } from '@/components/MoneroIcon';
 import { PaymentView } from '@/components/PaymentView';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -15,10 +16,11 @@ import { cn } from '@/lib/utils';
 
 const PRESETS = [5, 10, 25, 50, 100];
 
-const METHODS: Record<PaymentMethod, { label: string; icon: typeof Zap }> = {
+const METHODS: Record<PaymentMethod, { label: string; icon: ComponentType<{ className?: string }> }> = {
   stripe: { label: 'Card', icon: CreditCard },
   lightning: { label: 'Lightning', icon: Zap },
   bitcoin: { label: 'Bitcoin', icon: Bitcoin },
+  monero: { label: 'Monero', icon: MoneroIcon },
 };
 
 interface AddCreditsDialogProps {
@@ -44,7 +46,7 @@ export function AddCreditsDialog({ open, onOpenChange, payment }: AddCreditsDial
           <DialogTitle>{shown ? `Pay with ${METHODS[shown.method].label}` : 'Add credits'}</DialogTitle>
           <DialogDescription>
             {shown
-              ? shown.method === 'bitcoin'
+              ? shown.method === 'bitcoin' || shown.method === 'monero'
                 ? 'Credits are added once the payment confirms.'
                 : 'Credits are added as soon as the payment arrives.'
               : 'Credits pay for what you use, at the prices listed for each model.'}

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use tokio::sync::Semaphore;
 
 const MAX_CONNECTIONS: usize = 8;
@@ -168,7 +168,19 @@ fn open_connection(path: &Path) -> Result<Connection> {
 
 /// Apply whichever migrations a database is missing, each in a transaction of
 /// its own. Append-only: deployed databases have run the old ones.
+///
+/// Foreign keys are off while they run, as SQLite's way of changing a table
+/// (make a new one, copy, drop the old, rename) needs: dropping a table
+/// others reference would otherwise fail, or delete their rows. Each is
+/// checked before it commits instead.
 fn apply_migrations(conn: &mut Connection, migrations: &[(&str, &str)]) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let applied = apply_migrations_unchecked(conn, migrations);
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    applied
+}
+
+fn apply_migrations_unchecked(conn: &mut Connection, migrations: &[(&str, &str)]) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT")?;
     let applied: std::collections::HashSet<String> =
         conn.prepare("SELECT name FROM schema_migrations")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -178,6 +190,10 @@ fn apply_migrations(conn: &mut Connection, migrations: &[(&str, &str)]) -> Resul
         }
         let tx = conn.transaction()?;
         tx.execute_batch(sql).with_context(|| format!("migration {name}"))?;
+        let broken: Option<String> = tx.query_row("PRAGMA foreign_key_check", [], |r| r.get(0)).optional()?;
+        if let Some(table) = broken {
+            anyhow::bail!("migration {name} left rows in {table} referencing nothing");
+        }
         tx.execute("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)", params![name, crate::util::now()])?;
         tx.commit()?;
     }
@@ -220,6 +236,35 @@ mod tests {
         let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'payments' AND name LIKE 'payments_%'", [], |r| r.get(0)).unwrap();
         assert_eq!(indexes, 4);
         conn.execute("INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES ('pi_2', 'a', 'bitcoin', 'pending', 1, 0, 'bitcoin:x', 1, 2)", []).unwrap();
+    }
+
+    #[test]
+    fn keeps_bitcoin_addresses_tied_to_their_payments_through_the_monero_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_connection(&dir.path().join("t.sqlite3")).unwrap();
+        let before = migrations::MIGRATIONS.iter().position(|(name, _)| *name == "009_monero").unwrap();
+        apply_migrations(&mut conn, &migrations::MIGRATIONS[..before]).unwrap();
+        conn.execute(
+            "INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES ('pi_1', 'a', 'bitcoin', 'pending', 1, 0, 'bitcoin:x', 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO bitcoin_addresses (payment_id, xpub, idx, address, sats) VALUES ('pi_1', 'xpub1', 0, 'bc1qx', 1)", []).unwrap();
+        apply_migrations(&mut conn, migrations::MIGRATIONS).unwrap();
+
+        let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 1);
+        let address: String = conn.query_row("SELECT b.address FROM payments p JOIN bitcoin_addresses b ON b.payment_id = p.id", [], |r| r.get(0)).unwrap();
+        assert_eq!(address, "bc1qx");
+        // Still enforced: an address must belong to a payment, and a payment
+        // with one can't be deleted.
+        assert!(conn.execute("INSERT INTO bitcoin_addresses (payment_id, xpub, idx, address, sats) VALUES ('pi_none', 'xpub1', 1, 'bc1qy', 1)", []).is_err());
+        assert!(conn.execute("DELETE FROM payments WHERE id = 'pi_1'", []).is_err());
+        let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'payments' AND name LIKE 'payments_%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexes, 4);
+        conn.execute("INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES ('pi_2', 'a', 'monero', 'pending', 1, 0, 'monero:x', 1, 2)", []).unwrap();
+        assert!(conn.execute("INSERT INTO monero_addresses (payment_id, account, idx, address, piconero) VALUES ('pi_2', '4a', 0, '8x', 1)", []).is_err());
+        conn.execute("INSERT INTO monero_addresses (payment_id, account, idx, address, piconero) VALUES ('pi_2', '4a', 1, '8x', 1)", []).unwrap();
     }
 
     #[test]

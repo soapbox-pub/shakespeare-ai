@@ -855,6 +855,92 @@ async fn sells_credits_for_onchain_bitcoin() {
 }
 
 #[tokio::test]
+async fn sells_credits_for_monero() {
+    use crate::payments::monero::tests::{subaddress, FakeWallet};
+    let wallet = FakeWallet::default();
+    *wallet.login.lock() = Some(("shakespeare".into(), "hunter2".into()));
+    let url = wallet.serve().await;
+    let yaml = format!(
+        "origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  monero:\n    wallet_rpc: {url}\n    username: shakespeare\n    password: hunter2\n    confirmations: 2\nproviders: {{}}\nmodels: {{}}\n"
+    );
+    let t = temp_db();
+    let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
+    app.rates.set_xmr(rust_decimal::Decimal::from(400));
+
+    let unsigned = Request::builder().uri("/v1/credits/methods").body(Body::empty()).unwrap();
+    let (_, methods) = json_of(router(app.clone()).oneshot(unsigned).await.unwrap()).await;
+    assert_eq!(methods["data"], json!([{ "object": "payment_method", "id": "monero", "confirmations": 2 }]));
+
+    let add = || signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "monero" })));
+    let (status, first) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!((&first["method"], &first["status"], &first["total"]), (&json!("monero"), &json!("pending"), &json!(11.0)));
+    assert_eq!(first["description"], "Credit purchase via Monero");
+    // $11 at $400/XMR, to the wallet's first subaddress.
+    assert_eq!(first["url"], format!("monero:{}?tx_amount=0.0275&tx_description=Shakespeare%20AI%20Credits", subaddress(1)));
+    assert_eq!(first["monero"], json!({ "piconero": 27_500_000_000u64, "received": 0 }));
+    assert!(first.get("bitcoin").is_none());
+    let (_, second) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert!(second["url"].as_str().unwrap().starts_with(&format!("monero:{}?", subaddress(2))));
+
+    let status_of = |id: &str| app.db.with(|conn| Ok(store::get_payment(conn, id)?.unwrap().status)).unwrap();
+    let (first_id, second_id) = (first["id"].as_str().unwrap(), second["id"].as_str().unwrap());
+    let get = |uri: &str| signed("GET", uri, None);
+
+    // In the mempool: seen as soon as it's asked about, and pending in the
+    // balance, but not yet credited.
+    wallet.pay(1, 27_500_000_000, None);
+    let (_, payment) = json_of(router(app.clone()).oneshot(get(&format!("/v1/credits/payments/{first_id}"))).await.unwrap()).await;
+    assert_eq!((&payment["status"], &payment["monero"]), (&json!("pending"), &json!({ "piconero": 27_500_000_000u64, "received": 27_500_000_000u64 })));
+    let (_, credits) = json_of(router(app.clone()).oneshot(get("/v1/credits")).await.unwrap()).await;
+    assert_eq!((credits["amount"].as_f64(), credits["pending"].as_f64()), (Some(0.0), Some(10.0)));
+    // One block deep: not yet. Two: credited, once.
+    wallet.transfers.lock().clear();
+    wallet.pay(1, 27_500_000_000, Some(1));
+    crate::payments::check_monero_payments(&app).await.unwrap();
+    assert_eq!(status_of(first_id), "pending");
+    wallet.transfers.lock().clear();
+    wallet.pay(1, 27_500_000_000, Some(2));
+    crate::payments::check_monero_payments(&app).await.unwrap();
+    crate::payments::check_monero_payments(&app).await.unwrap();
+    assert_eq!(status_of(first_id), "completed");
+    assert_eq!(balance(&app), Money(10_000_000_000));
+
+    // Short by half: not until its time is up, then for what was paid.
+    wallet.pay(2, 13_750_000_000, Some(5));
+    crate::payments::check_monero_payments(&app).await.unwrap();
+    assert_eq!(status_of(second_id), "pending");
+    app.db.with(|conn| Ok(conn.execute("UPDATE payments SET expires_at = 1 WHERE id = ?", [second_id])?)).unwrap();
+    crate::payments::check_monero_payments(&app).await.unwrap();
+    assert_eq!(status_of(second_id), "completed");
+    assert_eq!(balance(&app), Money(15_000_000_000));
+
+    // Sent locked for later: not counted at all.
+    let (_, third) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    wallet.transfers.lock().push(json!({ "type": "in", "amount": 27_500_000_000u64, "confirmations": 9, "unlock_time": 9_000_000, "subaddr_index": { "major": 0, "minor": 3 } }));
+    crate::payments::check_monero_payments(&app).await.unwrap();
+    assert_eq!(status_of(third["id"].as_str().unwrap()), "pending");
+    assert_eq!(balance(&app), Money(15_000_000_000));
+
+    // A wallet made again from its keys starts over at 1; it's moved past
+    // the subaddresses already given out.
+    *wallet.next.lock() = 1;
+    let (_, fourth) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert!(fourth["url"].as_str().unwrap().starts_with(&format!("monero:{}?", subaddress(4))), "{fourth}");
+
+    // A redirect is only for Stripe.
+    let with_redirect = signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "monero", "redirect_url": "https://x.example" })));
+    let (status, body) = json_of(router(app.clone()).oneshot(with_redirect).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("invalid_parameter_combination")));
+    // Three open at once is the most.
+    let (status, _) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_open_payments")), "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("monero payments"));
+}
+
+#[tokio::test]
 async fn advances_credit_to_accounts_that_have_paid_before() {
     use crate::payments::bitcoin::tests::{FakeEsplora, FIRST, SECOND, ZPUB};
     let esplora = FakeEsplora::default();

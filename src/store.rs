@@ -72,6 +72,7 @@ pub enum Method {
     Stripe,
     Lightning,
     Bitcoin,
+    Monero,
 }
 
 impl Method {
@@ -80,6 +81,7 @@ impl Method {
             Method::Stripe => "stripe",
             Method::Lightning => "lightning",
             Method::Bitcoin => "bitcoin",
+            Method::Monero => "monero",
         }
     }
 
@@ -88,6 +90,7 @@ impl Method {
             "stripe" => Some(Method::Stripe),
             "lightning" => Some(Method::Lightning),
             "bitcoin" => Some(Method::Bitcoin),
+            "monero" => Some(Method::Monero),
             _ => None,
         }
     }
@@ -115,6 +118,10 @@ pub struct Payment {
     /// sent to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitcoin: Option<BitcoinSats>,
+    /// A monero payment's piconero: what it asked for, and what's been seen
+    /// sent to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monero: Option<MoneroPiconero>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -126,6 +133,14 @@ pub struct BitcoinSats {
     /// Credit its account may already spend, while what was sent confirms.
     #[serde(skip_serializing_if = "is_zero")]
     pub advanced: Money,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MoneroPiconero {
+    /// What it asked for, at the rate when it was made.
+    pub piconero: u64,
+    /// What's been sent, the mempool included, at the last check.
+    pub received: u64,
 }
 
 fn is_zero(money: &Money) -> bool {
@@ -157,12 +172,16 @@ pub fn insert_payment(conn: &Connection, p: &NewPayment) -> Result<()> {
     Ok(())
 }
 
-/// A payment's columns, read by [`payment_row`] from [`PAYMENTS`].
+/// A payment's columns, read by [`payment_row`] from [`PAYMENTS`]: as many
+/// as [`PAYMENT_COLUMN_COUNT`], so a query can read more after them.
 const PAYMENT_COLUMNS: &str =
-    "p.id, p.pubkey, p.method, p.status, p.amount, p.fee, p.url, p.provider_ref, p.created_at, p.completed_at, p.expires_at, b.sats, b.seen, b.advanced";
+    "p.id, p.pubkey, p.method, p.status, p.amount, p.fee, p.url, p.provider_ref, p.created_at, p.completed_at, p.expires_at, b.sats, b.seen, b.advanced, m.piconero, m.seen";
+const PAYMENT_COLUMN_COUNT: usize = 16;
 
-/// Payments, with a bitcoin payment's address. (No column names are shared.)
-const PAYMENTS: &str = "payments p LEFT JOIN bitcoin_addresses b ON b.payment_id = p.id";
+/// Payments, with a bitcoin or monero payment's address. (Only `payments`
+/// has the columns queries name unqualified: `id`, `pubkey`, `method`,
+/// `status`, `created_at`.)
+const PAYMENTS: &str = "payments p LEFT JOIN bitcoin_addresses b ON b.payment_id = p.id LEFT JOIN monero_addresses m ON m.payment_id = p.id";
 
 fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
     let method = Method::parse(&row.get::<_, String>(2)?).unwrap_or(Method::Stripe);
@@ -180,6 +199,7 @@ fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
             Method::Stripe => "Credit purchase via Stripe".into(),
             Method::Lightning => "Credit purchase via Lightning".into(),
             Method::Bitcoin => "Credit purchase via Bitcoin".into(),
+            Method::Monero => "Credit purchase via Monero".into(),
         },
         url: row.get(6)?,
         provider_ref: row.get(7)?,
@@ -188,6 +208,10 @@ fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
         expires_at: row.get(10)?,
         bitcoin: match row.get::<_, Option<i64>>(11)? {
             Some(sats) => Some(BitcoinSats { sats: sats as u64, received: row.get::<_, i64>(12)? as u64, advanced: Money(row.get(13)?) }),
+            None => None,
+        },
+        monero: match row.get::<_, Option<i64>>(14)? {
+            Some(piconero) => Some(MoneroPiconero { piconero: piconero as u64, received: row.get::<_, i64>(15)? as u64 }),
             None => None,
         },
     })
@@ -315,8 +339,8 @@ fn watch_row(r: &rusqlite::Row) -> rusqlite::Result<(Payment, BitcoinWatch)> {
         sats: r.get::<_, i64>(11)? as u64,
         seen: r.get::<_, i64>(12)? as u64,
         advanced: Money(r.get(13)?),
-        checked_at: r.get(14)?,
-        checked_height: r.get::<_, Option<i64>>(15)?.map(|h| h as u64),
+        checked_at: r.get(PAYMENT_COLUMN_COUNT)?,
+        checked_height: r.get::<_, Option<i64>>(PAYMENT_COLUMN_COUNT + 1)?.map(|h| h as u64),
     };
     Ok((payment_row(r)?, watch))
 }
@@ -352,13 +376,113 @@ pub fn complete_bitcoin_payment(conn: &mut Connection, id: &str, now: i64, amoun
     Ok(true)
 }
 
-/// Bitcoin payments still open to be paid, by one account or by everyone.
-pub fn open_bitcoin_payments(conn: &Connection, pubkey: Option<&str>, now: i64) -> Result<u32> {
+/// Payments by `method` still open to be paid, by one account or by
+/// everyone.
+pub fn open_payments(conn: &Connection, method: Method, pubkey: Option<&str>, now: i64) -> Result<u32> {
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM payments WHERE method = 'bitcoin' AND status = 'pending' AND expires_at > ?1 AND (?2 IS NULL OR pubkey = ?2)",
-        params![now, pubkey],
+        "SELECT COUNT(*) FROM payments WHERE method = ?3 AND status = 'pending' AND expires_at > ?1 AND (?2 IS NULL OR pubkey = ?2)",
+        params![now, pubkey, method.as_str()],
         |r| r.get(0),
     )?)
+}
+
+// Monero.
+
+/// The next subaddress index to give out for a wallet, named by its primary
+/// address: 1 for one never seen, since 0 is the primary address.
+pub fn next_monero_index(conn: &Connection, account: &str) -> Result<u32> {
+    let next: Option<i64> = conn.query_row("SELECT next_idx FROM monero_accounts WHERE account = ?", [account], |r| r.get(0)).optional()?;
+    Ok(u32::try_from(next.unwrap_or(1))?)
+}
+
+/// Record the subaddress a monero payment is paid to, and that its index is
+/// taken. Indexes come from the wallet, which hands them out in order; this
+/// keeps count too, so one made again from its keys, starting over, can be
+/// moved on past those already given out (see [`next_monero_index`]).
+pub fn insert_monero_address(conn: &Connection, payment_id: &str, account: &str, index: u32, address: &str, piconero: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO monero_addresses (payment_id, account, idx, address, piconero) VALUES (?, ?, ?, ?, ?)",
+        params![payment_id, account, index, address, i64::try_from(piconero)?],
+    )?;
+    conn.execute(
+        "INSERT INTO monero_accounts (account, next_idx) VALUES (?1, ?2) ON CONFLICT (account) DO UPDATE SET next_idx = MAX(next_idx, ?2)",
+        params![account, i64::from(index) + 1],
+    )?;
+    Ok(())
+}
+
+/// A watched monero subaddress: whose and which it is, what it's owed, and
+/// what it had when last checked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoneroWatch {
+    pub account: String,
+    pub index: u32,
+    pub piconero: u64,
+    pub seen: u64,
+    pub checked_at: Option<i64>,
+}
+
+const MONERO_WATCH_COLUMNS: &str = "m.account, m.idx, m.checked_at";
+
+/// Monero payments to look in on, with each subaddress's state: those
+/// pending, and those that expired within `grace` seconds, in case they're
+/// paid late. Everyone's, or one account's.
+pub fn monero_to_watch(conn: &Connection, pubkey: Option<&str>, now: i64, grace: i64) -> Result<Vec<(Payment, MoneroWatch)>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {PAYMENT_COLUMNS}, {MONERO_WATCH_COLUMNS} FROM {PAYMENTS}
+         WHERE p.method = 'monero' AND m.payment_id IS NOT NULL
+         AND (p.status = 'pending' OR (p.status = 'expired' AND p.expires_at > ?1)) AND (?2 IS NULL OR p.pubkey = ?2)
+         ORDER BY m.account, m.idx"
+    ))?;
+    let rows = stmt.query_map(params![now - grace, pubkey], monero_watch_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One monero payment, with its subaddress's state.
+pub fn monero_watch(conn: &Connection, id: &str) -> Result<Option<(Payment, MoneroWatch)>> {
+    let sql = format!("SELECT {PAYMENT_COLUMNS}, {MONERO_WATCH_COLUMNS} FROM {PAYMENTS} WHERE p.id = ? AND m.payment_id IS NOT NULL");
+    Ok(conn.query_row(&sql, [id], monero_watch_row).optional()?)
+}
+
+fn monero_watch_row(r: &rusqlite::Row) -> rusqlite::Result<(Payment, MoneroWatch)> {
+    let payment = payment_row(r)?;
+    let amounts = payment.monero.unwrap_or_default();
+    let watch = MoneroWatch {
+        account: r.get(PAYMENT_COLUMN_COUNT)?,
+        index: r.get(PAYMENT_COLUMN_COUNT + 1)?,
+        piconero: amounts.piconero,
+        seen: amounts.received,
+        checked_at: r.get(PAYMENT_COLUMN_COUNT + 2)?,
+    };
+    Ok((payment, watch))
+}
+
+/// Note what a subaddress had at a check, and when.
+pub fn record_monero_check(conn: &Connection, payment_id: &str, seen: u64, now: i64) -> Result<()> {
+    conn.execute("UPDATE monero_addresses SET seen = ?2, checked_at = ?3 WHERE payment_id = ?1", params![payment_id, i64::try_from(seen)?, now])?;
+    Ok(())
+}
+
+/// Complete a monero payment for what was actually paid: its credits and fee
+/// become `amount` and `fee`, and `paid` piconero are recorded. Credits move
+/// once, as for any payment.
+pub fn complete_monero_payment(conn: &mut Connection, id: &str, now: i64, amount: Money, fee: Money, paid: u64) -> Result<bool> {
+    let tx = write_tx(conn)?;
+    let pubkey: Option<String> = tx
+        .query_row(
+            "UPDATE payments SET status = 'completed', completed_at = ?2, amount = ?3, fee = ?4
+             WHERE id = ?1 AND method = 'monero' AND status IN ('pending', 'expired') RETURNING pubkey",
+            params![id, now, amount.nanos(), fee.nanos()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(pubkey) = pubkey else {
+        return Ok(false);
+    };
+    tx.execute("UPDATE monero_addresses SET paid = ?2 WHERE payment_id = ?1", params![id, i64::try_from(paid)?])?;
+    post(&tx, &pubkey, amount, Kind::Payment, id, now)?;
+    tx.commit()?;
+    Ok(true)
 }
 
 // Advances: credit before confirmation.
@@ -387,11 +511,11 @@ pub fn advances(conn: &Connection, pubkey: &str) -> Result<Money> {
     advanced(conn, Some(pubkey), "")
 }
 
-/// Credit an account has bought that can't be taken back: completed bitcoin
-/// and Lightning payments. (A card payment can be charged back.)
+/// Credit an account has bought that can't be taken back: completed bitcoin,
+/// monero and Lightning payments. (A card payment can be charged back.)
 fn final_purchases(conn: &Connection, pubkey: &str) -> Result<Money> {
     Ok(Money(conn.query_row(
-        "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE pubkey = ? AND status = 'completed' AND method IN ('bitcoin', 'lightning')",
+        "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE pubkey = ? AND status = 'completed' AND method IN ('bitcoin', 'monero', 'lightning')",
         [pubkey],
         |r| r.get(0),
     )?))
@@ -476,9 +600,10 @@ pub fn expire_stripe_payments(conn: &Connection, now: i64) -> Result<usize> {
 }
 
 /// Delete payments that expired before `before`, unpaid: nothing was
-/// credited for them, and they're no longer watched or payable. A bitcoin
-/// payment that was sent something is kept, as the record of where that
-/// money went. Their indexes stay taken (see [`take_bitcoin_index`]).
+/// credited for them, and they're no longer watched or payable. A bitcoin or
+/// monero payment that was sent something is kept, as the record of where
+/// that money went. Their indexes stay taken (see [`take_bitcoin_index`] and
+/// [`insert_monero_address`]).
 pub fn delete_expired_payments(conn: &mut Connection, before: i64) -> Result<usize> {
     let tx = write_tx(conn)?;
     tx.execute(
@@ -486,9 +611,15 @@ pub fn delete_expired_payments(conn: &mut Connection, before: i64) -> Result<usi
          AND payment_id IN (SELECT id FROM payments WHERE status = 'expired' AND expires_at < ?)",
         [before],
     )?;
+    tx.execute(
+        "DELETE FROM monero_addresses WHERE seen = 0 AND paid IS NULL
+         AND payment_id IN (SELECT id FROM payments WHERE status = 'expired' AND expires_at < ?)",
+        [before],
+    )?;
     let deleted = tx.execute(
         "DELETE FROM payments WHERE status = 'expired' AND expires_at < ?
-         AND NOT EXISTS (SELECT 1 FROM bitcoin_addresses b WHERE b.payment_id = payments.id)",
+         AND NOT EXISTS (SELECT 1 FROM bitcoin_addresses b WHERE b.payment_id = payments.id)
+         AND NOT EXISTS (SELECT 1 FROM monero_addresses m WHERE m.payment_id = payments.id)",
         [before],
     )?;
     tx.commit()?;
@@ -1134,9 +1265,72 @@ mod tests {
             assert_eq!(get_payment(conn, "pi_1")?.unwrap().bitcoin, Some(BitcoinSats { sats: 1000, received: 400, advanced: Money::ZERO }));
             assert_eq!(bitcoin_watch(conn, "pi_1")?.unwrap().1.seen, 400);
             assert!(bitcoin_to_watch(conn, Some("nobody"), 0, 50)?.is_empty());
-            assert_eq!(open_bitcoin_payments(conn, None, 0)?, 1);
-            assert_eq!(open_bitcoin_payments(conn, Some("nobody"), 0)?, 0);
-            assert_eq!(open_bitcoin_payments(conn, None, 100)?, 0);
+            assert_eq!(open_payments(conn, Method::Bitcoin, None, 0)?, 1);
+            assert_eq!(open_payments(conn, Method::Bitcoin, Some("nobody"), 0)?, 0);
+            assert_eq!(open_payments(conn, Method::Bitcoin, None, 100)?, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn watches_monero_payments_and_never_gives_a_subaddress_out_twice() {
+        let t = temp_db();
+        t.db.with(|conn| {
+            let open = |conn: &mut Connection, id: &str, expires_at: i64, index: u32| -> Result<()> {
+                let address = format!("8sub{index}");
+                let payment = NewPayment {
+                    id,
+                    pubkey: ALICE,
+                    method: Method::Monero,
+                    amount: DOLLAR,
+                    fee: Money::ZERO,
+                    url: "monero:x",
+                    provider_ref: Some(&address),
+                    created_at: 1,
+                    expires_at,
+                };
+                insert_payment(conn, &payment)?;
+                insert_monero_address(conn, id, "4wallet", index, &address, 1000)
+            };
+            // Index 0 is the primary address.
+            assert_eq!(next_monero_index(conn, "4wallet")?, 1);
+            open(conn, "pi_1", 100, 1)?;
+            open(conn, "pi_2", 100, 5)?;
+            assert_eq!(next_monero_index(conn, "4wallet")?, 6);
+            // An earlier index doesn't move the count back.
+            open(conn, "pi_3", 10, 3)?;
+            assert_eq!(next_monero_index(conn, "4wallet")?, 6);
+            assert_eq!(next_monero_index(conn, "4other")?, 1);
+            // Nor can one be given out twice.
+            assert!(open(conn, "pi_4", 100, 5).is_err());
+            conn.execute("DELETE FROM payments WHERE id = 'pi_4'", [])?;
+
+            expire_payment(conn, "pi_2")?;
+            expire_payment(conn, "pi_3")?;
+            let ids = |now| -> Result<Vec<String>> { Ok(monero_to_watch(conn, None, now, 50)?.into_iter().map(|(p, _)| p.id).collect()) };
+            assert_eq!(ids(100)?, ["pi_1", "pi_2"]);
+            assert_eq!(ids(200)?, ["pi_1"]);
+            let first = MoneroWatch { account: "4wallet".into(), index: 1, piconero: 1000, ..MoneroWatch::default() };
+            assert_eq!(monero_to_watch(conn, None, 0, 50)?[0].1, first);
+            record_monero_check(conn, "pi_1", 400, 7)?;
+            assert_eq!(monero_watch(conn, "pi_1")?.unwrap().1, MoneroWatch { seen: 400, checked_at: Some(7), ..first });
+            assert_eq!(get_payment(conn, "pi_1")?.unwrap().monero, Some(MoneroPiconero { piconero: 1000, received: 400 }));
+            assert_eq!(get_payment(conn, "pi_1")?.unwrap().bitcoin, None);
+            assert!(monero_to_watch(conn, Some("nobody"), 0, 50)?.is_empty());
+            assert_eq!(open_payments(conn, Method::Monero, None, 0)?, 1);
+            assert_eq!(open_payments(conn, Method::Bitcoin, None, 0)?, 0);
+
+            // Credited once, for what was paid; then it counts as final.
+            assert!(complete_monero_payment(conn, "pi_1", 8, Money(500_000_000), Money::ZERO, 500)?);
+            assert!(!complete_monero_payment(conn, "pi_1", 9, Money(500_000_000), Money::ZERO, 500)?);
+            assert_eq!(balance(conn, ALICE)?, Money(500_000_000));
+            assert_eq!(final_purchases(conn, ALICE)?, Money(500_000_000));
+
+            // Long expired and never sent anything: deleted, its index still taken.
+            assert_eq!(delete_expired_payments(conn, 1000)?, 2);
+            assert!(get_payment(conn, "pi_2")?.is_none());
+            assert_eq!(next_monero_index(conn, "4wallet")?, 6);
             Ok(())
         })
         .unwrap();

@@ -71,11 +71,13 @@ pub struct Payments {
     pub lightning: Option<Lightning>,
     #[serde(default)]
     pub bitcoin: Option<Bitcoin>,
+    #[serde(default)]
+    pub monero: Option<Monero>,
 }
 
 impl Default for Payments {
     fn default() -> Self {
-        Payments { fee: default_fee(), minimum: default_minimum(), stripe: None, lightning: None, bitcoin: None }
+        Payments { fee: default_fee(), minimum: default_minimum(), stripe: None, lightning: None, bitcoin: None, monero: None }
     }
 }
 
@@ -201,6 +203,37 @@ fn default_confirmations() -> u32 {
 impl Bitcoin {
     pub fn esplora(&self) -> url::Url {
         self.esplora.clone().unwrap_or_else(|| url::Url::parse(DEFAULT_ESPLORA).expect("a URL"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Monero {
+    /// `monero-wallet-rpc`'s JSON-RPC endpoint (`http://host:port/json_rpc`),
+    /// with a view-only wallet open: it scans the chain, and each payment gets
+    /// a new subaddress in its first account. Its answers decide what's
+    /// credited, so it must be ours, on our own node.
+    pub wallet_rpc: url::Url,
+    /// The login it was started with (`--rpc-login`), if any.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, deserialize_with = "optional_secret")]
+    pub password: Option<String>,
+    /// How deep a payment's transaction must be before it's credited. Zero
+    /// credits it from the mempool, where it can still be double-spent.
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u32,
+    /// The most monero payments that may be open at once, everyone's
+    /// together. Each takes the next subaddress, which the wallet the money
+    /// is spent from must look far enough ahead to see.
+    #[serde(default = "default_max_pending")]
+    pub max_pending: u32,
+}
+
+impl Monero {
+    pub fn rpc<'a>(&'a self, http: &'a reqwest::Client) -> crate::payments::monero::Rpc<'a> {
+        let login = self.username.as_deref().zip(self.password.as_deref());
+        crate::payments::monero::Rpc { http, url: &self.wallet_rpc, login }
     }
 }
 
@@ -580,6 +613,12 @@ fn secret<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error
     resolve_secret(&raw).map_err(serde::de::Error::custom)
 }
 
+/// A [`secret`] that may be left out.
+fn optional_secret<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let raw = Option::<String>::deserialize(deserializer)?;
+    raw.map(|raw| resolve_secret(&raw).map_err(serde::de::Error::custom)).transpose()
+}
+
 fn resolve_secret(raw: &str) -> Result<String, String> {
     let Some(name) = raw.strip_prefix("${").and_then(|r| r.strip_suffix('}')) else {
         return Ok(raw.to_string());
@@ -630,6 +669,14 @@ impl Config {
             && bitcoin.xpub.network() != ::bitcoin::Network::Bitcoin
         {
             bail!("payments.bitcoin.esplora must be set for a testnet key, such as https://mempool.space/testnet4/api");
+        }
+        if let Some(monero) = &self.payments.monero {
+            if monero.username.is_some() != monero.password.is_some() {
+                bail!("payments.monero needs both username and password, or neither");
+            }
+            if !matches!(monero.wallet_rpc.scheme(), "http" | "https") {
+                bail!("payments.monero.wallet_rpc must be an http or https URL, such as http://monero.lan:18083/json_rpc");
+            }
         }
         if self.routing.failures == 0 {
             bail!("routing.failures must be at least 1");
@@ -685,7 +732,7 @@ mod tests {
         // SAFETY: tests that read these variables only ever set them to the
         // same values.
         unsafe {
-            for var in ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"] {
+            for var in ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "MONERO_WALLET_RPC_PASSWORD"] {
                 std::env::set_var(var, "x");
             }
         }
@@ -708,6 +755,7 @@ mod tests {
         assert_eq!(config.providers["openrouter"].base_url().as_str(), "https://openrouter.ai/api/v1");
         assert_eq!(config.routing.first_byte_timeout, Duration::from_secs(60));
         assert_eq!(config.payments.bitcoin.unwrap().xpub.address(0).unwrap(), crate::payments::bitcoin::tests::FIRST);
+        assert_eq!(config.payments.monero.unwrap().wallet_rpc.as_str(), "http://monero.lan:18083/json_rpc");
     }
 
     #[test]
@@ -756,6 +804,15 @@ mod tests {
         tpub[..4].copy_from_slice(&[0x04, 0x35, 0x87, 0xcf]);
         let tpub = ::bitcoin::base58::encode_check(&tpub);
         assert!(bitcoin(&format!("    xpub: {tpub}\n")).unwrap_err().to_string().contains("esplora"));
+
+        let monero = |section: &str| Config::parse(&format!("{base}models: {{}}\npayments:\n  monero:\n{section}"));
+        let m = monero("    wallet_rpc: http://monero.lan:18083/json_rpc\n").unwrap().payments.monero.unwrap();
+        assert_eq!((m.confirmations, m.max_pending, m.username, m.password), (1, 200, None, None));
+        let m = monero("    wallet_rpc: http://monero.lan:18083/json_rpc\n    username: u\n    password: p\n    confirmations: 3\n").unwrap().payments.monero.unwrap();
+        assert_eq!((m.confirmations, m.username.as_deref(), m.password.as_deref()), (3, Some("u"), Some("p")));
+        assert!(monero("    wallet_rpc: http://monero.lan:18083/json_rpc\n    username: u\n").unwrap_err().to_string().contains("both"));
+        assert!(monero("    wallet_rpc: ftp://monero.lan/\n").is_err());
+        assert!(monero("    wallet_rpc: http://x/json_rpc\n    password: ${SHAKESPEARE_TEST_UNSET}\n    username: u\n").unwrap_err().to_string().contains("not set"));
     }
 
     #[test]

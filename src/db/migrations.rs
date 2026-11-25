@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP), ("008_bitcoin_advances", BITCOIN_ADVANCES)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP), ("008_bitcoin_advances", BITCOIN_ADVANCES), ("009_monero", MONERO)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -248,5 +248,66 @@ CREATE TABLE distrusted (
     -- The payment that wasn't paid. It may since have been deleted.
     payment_id TEXT NOT NULL,
     created_at INTEGER NOT NULL
+) STRICT;
+"#;
+
+/// Monero payments. `payments` is rebuilt to allow the new method, as for
+/// bitcoin; migrations run with foreign keys off for that, so the tables
+/// that reference it keep doing so.
+const MONERO: &str = r#"
+CREATE TABLE payments_new (
+    id TEXT PRIMARY KEY,
+    pubkey TEXT NOT NULL,
+    method TEXT NOT NULL CHECK (method IN ('stripe', 'lightning', 'bitcoin', 'monero')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed', 'expired')),
+    -- Credits bought, and the fee charged on top; the total is their sum.
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    fee INTEGER NOT NULL CHECK (fee >= 0),
+    -- Where to pay: a Stripe Checkout URL, a bolt11 invoice, a BIP21
+    -- bitcoin: URI, or a monero: URI.
+    url TEXT NOT NULL,
+    -- How to check on it: the Stripe Checkout session id, the LUD-21 verify
+    -- URL, or the bitcoin or monero address. NULL for payments carried over
+    -- without one.
+    provider_ref TEXT,
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    expires_at INTEGER NOT NULL
+) STRICT;
+
+INSERT INTO payments_new SELECT id, pubkey, method, status, amount, fee, url, provider_ref, created_at, completed_at, expires_at FROM payments;
+DROP TABLE payments;
+ALTER TABLE payments_new RENAME TO payments;
+
+CREATE INDEX payments_pubkey ON payments (pubkey, created_at DESC, id DESC);
+CREATE INDEX payments_pending ON payments (expires_at) WHERE status = 'pending';
+CREATE INDEX payments_open ON payments (method, status, expires_at, pubkey);
+CREATE INDEX payments_expired ON payments (expires_at) WHERE status = 'expired';
+
+-- The subaddress each monero payment is paid to: the wallet's, at `idx` in
+-- its first account, never given out twice.
+CREATE TABLE monero_addresses (
+    payment_id TEXT PRIMARY KEY REFERENCES payments (id),
+    -- The wallet's primary address, which names it.
+    account TEXT NOT NULL,
+    -- 0 is the primary address itself, never given out.
+    idx INTEGER NOT NULL CHECK (idx > 0),
+    address TEXT NOT NULL UNIQUE,
+    -- What's owed, at the rate when the payment was made.
+    piconero INTEGER NOT NULL CHECK (piconero > 0),
+    -- Piconero sent to it, the mempool included, at the last check, and when
+    -- that was. NULL: never.
+    seen INTEGER NOT NULL DEFAULT 0,
+    checked_at INTEGER,
+    -- The confirmed piconero the payment was credited for.
+    paid INTEGER,
+    UNIQUE (account, idx)
+) STRICT;
+
+-- The next subaddress index for each wallet. Never goes down, so an address
+-- whose payment was deleted is never given out again.
+CREATE TABLE monero_accounts (
+    account TEXT PRIMARY KEY,
+    next_idx INTEGER NOT NULL CHECK (next_idx > 0)
 ) STRICT;
 "#;
