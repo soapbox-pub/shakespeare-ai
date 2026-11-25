@@ -47,6 +47,14 @@ export function isUnsettled(payment: Payment): boolean {
   return payment.status === 'pending' || isConfirming(payment);
 }
 
+export const PAYMENT_STATUS: Record<Payment['status'], { label: string; variant: 'default' | 'secondary' | 'outline' }> = {
+  completed: { label: 'Paid', variant: 'default' },
+  pending: { label: 'Pending', variant: 'secondary' },
+  expired: { label: 'Expired', variant: 'outline' },
+};
+
+export const METHOD_LABELS: Record<PaymentMethod, string> = { stripe: 'Card', lightning: 'Lightning', bitcoin: 'Bitcoin' };
+
 export interface Generation {
   id: string;
   model: string;

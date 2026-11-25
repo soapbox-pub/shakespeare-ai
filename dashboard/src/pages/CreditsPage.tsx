@@ -7,6 +7,7 @@ import { BuyGiftcardsDialog } from '@/components/BuyGiftcardsDialog';
 import { EmptyState } from '@/components/EmptyState';
 import { GiftcardList } from '@/components/GiftcardList';
 import { PageHeader, SectionHeader } from '@/components/PageHeader';
+import { PaymentDetailsDialog } from '@/components/PaymentDetailsDialog';
 import { RedeemGiftcardDialog } from '@/components/RedeemGiftcardDialog';
 import { RequireLogin } from '@/components/RequireLogin';
 import { Badge } from '@/components/ui/badge';
@@ -14,7 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { useBalance, usePayments } from '@/hooks/useCredits';
-import { isConfirming, type Payment } from '@/lib/api';
+import { isConfirming, METHOD_LABELS, type Payment, PAYMENT_STATUS } from '@/lib/api';
 import { dateTime, usd } from '@/lib/format';
 import { codeFromHash } from '@/lib/giftcards';
 
@@ -106,17 +107,16 @@ function Credits() {
   );
 }
 
-const STATUS: Record<Payment['status'], { label: string; variant: 'default' | 'secondary' | 'outline' }> = {
-  completed: { label: 'Paid', variant: 'default' },
-  pending: { label: 'Pending', variant: 'secondary' },
-  expired: { label: 'Expired', variant: 'outline' },
-};
-
-const METHOD_LABELS: Record<Payment['method'], string> = { stripe: 'Card', lightning: 'Lightning', bitcoin: 'Bitcoin' };
-
 function PaymentHistory({ onResume }: { onResume: (payment: Payment) => void }) {
   const payments = usePayments();
   const rows = payments.data?.pages.flatMap((page) => page.data) ?? [];
+  const [viewingId, setViewingId] = useState<string>();
+  // Follow the list as it refreshes, so an open receipt shows a payment settling.
+  const viewing = rows.find((payment) => payment.id === viewingId);
+  const resume = (payment: Payment) => {
+    setViewingId(undefined);
+    onResume(payment);
+  };
 
   return (
     <section className="space-y-4">
@@ -141,7 +141,17 @@ function PaymentHistory({ onResume }: { onResume: (payment: Payment) => void }) 
             </TableHeader>
             <TableBody>
               {rows.map((payment) => (
-                <TableRow key={payment.id}>
+                <TableRow
+                  key={payment.id}
+                  tabIndex={0}
+                  className="cursor-pointer focus-visible:bg-accent/40 focus-visible:outline-none"
+                  onClick={() => setViewingId(payment.id)}
+                  onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
+                    event.preventDefault();
+                    setViewingId(payment.id);
+                  }}
+                >
                   <TableCell className="whitespace-nowrap">{dateTime(payment.created_at)}</TableCell>
                   <TableCell className="hidden sm:table-cell">{METHOD_LABELS[payment.method]}</TableCell>
                   <TableCell className="hidden text-right tabular-nums sm:table-cell">{usd(payment.amount)}</TableCell>
@@ -151,18 +161,29 @@ function PaymentHistory({ onResume }: { onResume: (payment: Payment) => void }) 
                       <button
                         type="button"
                         className="rounded-md focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-                        onClick={() => onResume(payment)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onResume(payment);
+                        }}
                       >
                         <Badge variant="secondary">
                           <Hourglass className="size-3" aria-hidden /> Confirming
                         </Badge>
                       </button>
                     ) : payment.status === 'pending' ? (
-                      <Button variant="link" size="sm" className="h-auto p-0" onClick={() => onResume(payment)}>
+                      <Button
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onResume(payment);
+                        }}
+                      >
                         Pay now
                       </Button>
                     ) : (
-                      <Badge variant={STATUS[payment.status].variant}>{STATUS[payment.status].label}</Badge>
+                      <Badge variant={PAYMENT_STATUS[payment.status].variant}>{PAYMENT_STATUS[payment.status].label}</Badge>
                     )}
                   </TableCell>
                 </TableRow>
@@ -176,6 +197,7 @@ function PaymentHistory({ onResume }: { onResume: (payment: Payment) => void }) 
           Show more
         </Button>
       )}
+      <PaymentDetailsDialog payment={viewing} onOpenChange={(open) => !open && setViewingId(undefined)} onResume={resume} />
     </section>
   );
 }
