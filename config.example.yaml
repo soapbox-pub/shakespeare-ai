@@ -76,7 +76,10 @@ routing:
 # OpenRouter's extras (usage accounting, which records what each request cost
 # us, and prompt caching breakpoints for anthropic/ models); or `anthropic`,
 # Anthropic's Messages API, with prompt caching (chat only). `base_url`
-# defaults to the usual one for `api`.
+# defaults to the usual one for `api`. A chat request's session (its
+# `session_id`, or the `x-session-id` header) is hashed with the caller's
+# pubkey and sent as OpenRouter's `session_id` or OpenAI's `prompt_cache_key`,
+# to keep the conversation on one prompt cache.
 providers:
   anthropic:
     api: anthropic

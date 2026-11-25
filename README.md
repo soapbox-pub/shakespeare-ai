@@ -355,8 +355,12 @@ of their own, since their effects are already in the opening balances.
   Anything else is ignored, so a client can't reach a provider's own options
   (OpenRouter's `models` fallbacks could run any model on a free one), and
   `n` is gone. A field in the schema with the wrong shape is a 400. No client
-  header is passed on, `Accept-Language` included. If OpenRouter reports a
-  cost for a free model anyway, it's charged.
+  header is passed on, `Accept-Language` included. A session (`session_id`,
+  or the `x-session-id` header Shakespeare sends) reaches a provider only as
+  its hash with the caller's pubkey: OpenRouter's `session_id`, for sticky
+  routing to one provider's prompt cache, or OpenAI's `prompt_cache_key`, so
+  no two accounts share a key or see each other's session names. If
+  OpenRouter reports a cost for a free model anyway, it's charged.
 - **Interrupted streams are charged for.** If a client hangs up, or stops
   reading, the provider's stream is still read to its end and charged by the
   usage it reports, as the provider charges us. Only a stream that ends with

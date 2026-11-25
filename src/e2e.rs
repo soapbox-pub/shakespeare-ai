@@ -33,6 +33,11 @@ async fn fake_upstream() -> String {
             assert!(request.get(field).is_none(), "{field} reached the provider");
         }
         assert!(headers.get("accept-language").is_none() && headers.get("x-session-id").is_none());
+        if request["messages"][0]["content"] == "which session?" {
+            // What it was told the conversation is, as the id we hand back.
+            let id = json!({ "session_id": request.get("session_id"), "prompt_cache_key": request.get("prompt_cache_key") });
+            return axum::Json(json!({ "id": id, "object": "chat.completion", "created": 1, "choices": [], "usage": { "prompt_tokens": 1, "completion_tokens": 1 } })).into_response();
+        }
         // As OpenRouter does, when asked: what it really cost.
         let cost = if request["usage"]["include"] == true { json!(0.5) } else { Value::Null };
         if request["stream"] == true {
@@ -343,6 +348,34 @@ async fn sends_providers_only_what_the_schema_allows() {
     let bad = signed("POST", "/v1/chat/completions", Some(json!({ "model": "paid", "messages": [{ "role": "function", "content": "x" }] })));
     let (status, body) = json_of(router(app.clone()).oneshot(bad).await.unwrap()).await;
     assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("invalid_parameter")));
+}
+
+#[tokio::test]
+async fn keeps_a_session_on_one_cache_under_a_name_of_our_own() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let key = |session: &str| json!(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(format!("{}:{session}", public_key(SECRET)))));
+    let ask = |model: &str, session_id: Option<&str>, header: Option<&str>| {
+        let mut body = json!({ "model": model, "messages": [{ "role": "user", "content": "which session?" }] });
+        if let Some(session_id) = session_id {
+            body["session_id"] = json!(session_id);
+        }
+        let mut request = signed("POST", "/v1/chat/completions", Some(body));
+        if let Some(header) = header {
+            request.headers_mut().insert("x-session-id", header.parse().unwrap());
+        }
+        let app = app.clone();
+        async move {
+            let (status, body) = json_of(router(app).oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["id"].clone()
+        }
+    };
+    // Shakespeare's header: OpenAI is told it as a prompt cache key…
+    assert_eq!(ask("paid", None, Some("s")).await, json!({ "session_id": null, "prompt_cache_key": key("s") }));
+    // …OpenRouter as a session, and the body's goes before the header's.
+    assert_eq!(ask("routed-free", Some("s"), Some("t")).await, json!({ "session_id": key("s"), "prompt_cache_key": null }));
+    assert_eq!(ask("paid", None, None).await, json!({ "session_id": null, "prompt_cache_key": null }));
 }
 
 #[tokio::test]

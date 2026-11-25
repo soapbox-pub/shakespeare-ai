@@ -43,6 +43,11 @@ pub struct ChatRequest {
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The conversation this request belongs to, as OpenRouter takes it (or
+    /// the `x-session-id` header). It never reaches a provider as sent:
+    /// see [`crate::api::chat::session_key`].
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

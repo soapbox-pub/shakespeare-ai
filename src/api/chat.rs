@@ -11,6 +11,7 @@ use axum::Json;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::anthropic;
@@ -78,9 +79,10 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     };
 
     let stream = request.is_stream();
+    let session = session_key(&caller.pubkey, &request, &headers);
     let first_byte_timeout = app.config.routing.first_byte_timeout;
     let (attempt, upstream) = upstream::route(&app, &model_id, &model.upstreams, |upstream, provider| {
-        let body = upstream_body(&request, upstream, provider);
+        let body = upstream_body(&request, upstream, provider, session.as_deref());
         let app = &app;
         async move {
             let label = upstream.label();
@@ -163,14 +165,36 @@ enum Reply {
     Stream(BoxStream<'static, reqwest::Result<Bytes>>),
 }
 
+/// The key that keeps a conversation on one provider's prompt cache, from
+/// the client's `session_id` or, failing that, its `x-session-id` header
+/// (Shakespeare sends the header). It's hashed with the caller's pubkey, so
+/// two people's sessions of the same name never share a cache, and no
+/// provider sees what our users call their sessions.
+pub fn session_key(pubkey: &str, request: &ChatRequest, headers: &HeaderMap) -> Option<String> {
+    let header = headers.get("x-session-id").and_then(|h| h.to_str().ok());
+    let session = request.session_id.as_deref().or(header).map(str::trim).filter(|s| !s.is_empty())?;
+    Some(hex::encode(Sha256::digest(format!("{pubkey}:{session}"))))
+}
+
 /// The request body for one upstream: the client's request in that
 /// provider's dialect, with the upstream's own `params` over it.
-fn upstream_body(request: &ChatRequest, upstream: &Upstream, provider: &Provider) -> Vec<u8> {
+fn upstream_body(request: &ChatRequest, upstream: &Upstream, provider: &Provider, session: Option<&str>) -> Vec<u8> {
     let openrouter = provider.api == Api::Openrouter;
     let mut body = match provider.api {
         Api::Anthropic => anthropic::request(request, &upstream.model),
         Api::Openai | Api::Openrouter => request.upstream(&upstream.model, openrouter),
     };
+    // Each provider's way to route a conversation to its cache. Anthropic
+    // routes on its own and has none.
+    // https://openrouter.ai/docs/guides/best-practices/prompt-caching#provider-sticky-routing
+    // https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-keys
+    if let Some(session) = session {
+        match provider.api {
+            Api::Openrouter => _ = body.insert("session_id".into(), session.into()),
+            Api::Openai => _ = body.insert("prompt_cache_key".into(), session.into()),
+            Api::Anthropic => {}
+        }
+    }
     if openrouter {
         // https://openrouter.ai/docs/use-cases/usage-accounting
         body.insert("usage".into(), json!({ "include": true }));
@@ -552,5 +576,41 @@ mod tests {
         assert_eq!(messages[3]["content"][1]["cache_control"]["type"], "ephemeral");
         assert!(request["tools"][0].get("cache_control").is_none());
         assert_eq!(request["tools"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn keys_sessions_by_caller() {
+        let request = |body: Value| serde_json::from_value::<ChatRequest>(body).unwrap();
+        let plain = request(json!({ "model": "m", "messages": [] }));
+        let named = request(json!({ "model": "m", "messages": [], "session_id": "s" }));
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_key("a", &plain, &headers), None);
+        headers.insert("x-session-id", " ".parse().unwrap());
+        assert_eq!(session_key("a", &plain, &headers), None);
+        headers.insert("x-session-id", "s".parse().unwrap());
+        let key = session_key("a", &plain, &headers).unwrap();
+        assert_eq!(key, hex::encode(Sha256::digest("a:s")));
+        assert_ne!(session_key("b", &plain, &headers), Some(key.clone()));
+        // The body's wins, as it does at OpenRouter.
+        headers.insert("x-session-id", "other".parse().unwrap());
+        assert_eq!(session_key("a", &named, &headers), Some(key));
+    }
+
+    #[test]
+    fn sends_each_provider_its_session_field() {
+        let request: ChatRequest = serde_json::from_value(json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }], "session_id": "raw" })).unwrap();
+        let body = |api: &str, params: Value| {
+            let provider: Provider = serde_json::from_value(json!({ "api": api, "api_key": "k" })).unwrap();
+            let upstream = Upstream { provider: "p".into(), model: "x".into(), params: params.as_object().unwrap().clone() };
+            serde_json::from_slice::<Value>(&upstream_body(&request, &upstream, &provider, Some("key"))).unwrap()
+        };
+        let openrouter = body("openrouter", json!({}));
+        assert_eq!((&openrouter["session_id"], openrouter.get("prompt_cache_key")), (&json!("key"), None));
+        let openai = body("openai", json!({}));
+        assert_eq!((openai.get("session_id"), &openai["prompt_cache_key"]), (None, &json!("key")));
+        let anthropic = body("anthropic", json!({}));
+        assert!(anthropic.get("session_id").is_none() && anthropic.get("prompt_cache_key").is_none());
+        // An upstream's params still have the last word.
+        assert_eq!(body("openai", json!({ "prompt_cache_key": null }))["prompt_cache_key"], Value::Null);
     }
 }

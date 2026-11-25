@@ -122,6 +122,7 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
                 ['parallel_tool_calls', 'boolean', 'No', 'Whether the model may call several tools at once'],
                 ['response_format', 'object', 'No', 'text, json_object, or json_schema'],
                 ['reasoning_effort', 'string', 'No', 'none, minimal, low, medium, high or xhigh, for models that reason'],
+                ['session_id', 'string', 'No', 'The conversation, to keep it on one prompt cache (or the x-session-id header)'],
                 ['top_p, stop, seed, frequency_penalty, presence_penalty', '', 'No', 'As in OpenAI\'s API'],
               ]}
             />
