@@ -322,8 +322,9 @@ Images are checked against the most they could cost. An account can have 100
 keys that aren't revoked.
 
 A balance is held, not just checked. Before calling a provider, a request
-sets aside what it's likely to cost: a chat its prompt (estimated from its
-text, and about 1,600 tokens an image) plus `max_tokens`, at most 4,096, of
+sets aside what it's likely to cost: a chat its prompt (estimated from all
+the JSON it's written in, keys and numbers too, and about 1,600 tokens an
+image) plus `max_tokens`, at most 4,096, of
 output; an image request the most it could cost. The check and the hold are
 one write transaction against the balance less every other hold, so
 concurrent requests can't all spend the same credit. Without enough to hold,

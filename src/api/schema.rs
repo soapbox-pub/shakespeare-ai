@@ -253,24 +253,33 @@ impl ChatRequest {
         self.max_completion_tokens.or(self.max_tokens)
     }
 
-    /// Roughly how many tokens the prompt is, before a provider says: its
-    /// text at about four bytes a token, and each image as a typical one.
-    /// (An image's bytes say nothing of its tokens: a provider scales it.)
+    /// Roughly how many tokens the prompt is, before a provider says: all of
+    /// it at about four bytes a token, and each image as a typical one. (An
+    /// image's bytes say nothing of its tokens: a provider scales it.)
+    ///
+    /// All of it means every byte it's written in, keys and numbers and
+    /// punctuation too, not only its strings: a provider reads a tool's
+    /// schema whole, and a hold that counted only its strings could be made
+    /// as small as anyone liked. Only the images' own URLs are left out.
     pub fn prompt_tokens_estimate(&self) -> u64 {
         /// About what a 1024×1024 image is to Claude or GPT.
         const IMAGE_TOKENS: u64 = 1600;
-        fn walk(value: &Value, key: Option<&str>) -> (u64, u64) {
-            match value {
-                Value::String(_) if key == Some("url") => (0, 1),
-                Value::String(s) => (s.len() as u64, 0),
-                Value::Array(items) => items.iter().map(|v| walk(v, None)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)),
-                Value::Object(map) => map.iter().map(|(k, v)| walk(v, Some(k))).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)),
-                _ => (0, 0),
-            }
-        }
-        let (messages, images) = serde_json::to_value(&self.messages).map_or((0, 0), |v| walk(&v, None));
-        let (tools, _) = serde_json::to_value(&self.tools).map_or((0, 0), |v| walk(&v, None));
-        (messages + tools).div_ceil(4) + images * IMAGE_TOKENS
+        let images = self.messages.iter().flat_map(|message| match message {
+            Message::System { content, .. } | Message::Developer { content, .. } | Message::User { content, .. } | Message::Tool { content, .. } => Some(content),
+            Message::Assistant { content, .. } => content.as_ref(),
+        });
+        let images: Vec<&str> = images
+            .flat_map(|content| match content {
+                Content::Text(_) => &[][..],
+                Content::Parts(parts) => parts.as_slice(),
+            })
+            .filter_map(|part| match part {
+                Part::ImageUrl { image_url } => Some(image_url.url.as_str()),
+                Part::Text { .. } => None,
+            })
+            .collect();
+        let bytes = (json_length(&self.messages) + json_length(&self.tools)).saturating_sub(images.iter().map(|url| url.len() as u64).sum());
+        bytes.div_ceil(4) + images.len() as u64 * IMAGE_TOKENS
     }
 
     /// The request for a provider, as a JSON object to add our own fields
@@ -315,6 +324,23 @@ impl ChatRequest {
         }
         out
     }
+}
+
+/// How many bytes `value` is as JSON, counted rather than written out.
+fn json_length(value: &impl Serialize) -> u64 {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
 }
 
 #[cfg(test)]
@@ -368,6 +394,28 @@ mod tests {
         assert!(other["messages"][2].get("reasoning_details").is_none());
         // Writing one upstream's request leaves the next's alone.
         assert_eq!(request.upstream("google/gemma", true)["messages"][2]["reasoning_details"], json!([{ "type": "reasoning.text" }]));
+    }
+
+    #[test]
+    fn estimates_every_byte_of_the_prompt() {
+        let estimate = |body: Value| parse(body).unwrap().prompt_tokens_estimate();
+        let big = "x".repeat(40_000);
+        // A schema's keys and numbers are read by the provider, so they count.
+        let mut properties = serde_json::Map::new();
+        for i in 0..1000 {
+            properties.insert(format!("{big:.36}{i:04}"), json!({ "enum": [1, 2, 3] }));
+        }
+        let tools = json!([{ "type": "function", "function": { "name": "f", "parameters": { "type": "object", "properties": properties } } }]);
+        assert!(estimate(json!({ "model": "m", "messages": [], "tools": tools })) > 15_000);
+        // A string under a key called `url` is only an image in an image part.
+        let disguised = json!([{ "type": "function", "function": { "name": "f", "parameters": { "url": big } } }]);
+        assert!(estimate(json!({ "model": "m", "messages": [], "tools": disguised })) > 10_000);
+        let reasoning = json!([{ "role": "assistant", "content": null, "reasoning_details": [{ "url": big }] }]);
+        assert!(estimate(json!({ "model": "m", "messages": reasoning })) > 10_000);
+        // A real image is a typical image, however big its data.
+        let image = json!([{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{big}") } }] }]);
+        assert!((1600..1650).contains(&estimate(json!({ "model": "m", "messages": image }))));
+        assert!(estimate(json!({ "model": "m", "messages": [{ "role": "user", "content": big }] })) >= 10_000);
     }
 
     #[test]
