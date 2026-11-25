@@ -445,7 +445,7 @@ const WINDOW: Duration = Duration::from_secs(60 * 60);
 
 impl RateLimiter {
     pub fn check(&self, bucket: &'static str, ip: &ClientIp, limit: u32) -> Result<(), ApiError> {
-        let Some(ip) = ip.0 else { return Ok(()) };
+        let Some(ip) = ip.0.map(limited_as) else { return Ok(()) };
         let now = Instant::now();
         let mut windows = self.windows.lock();
         if windows.len() > 100_000 {
@@ -463,9 +463,36 @@ impl RateLimiter {
     }
 }
 
+/// Who a rate limit counts an address as: an IPv4 address itself, and an
+/// IPv6 one by its /64, the least a network hands one customer, who could
+/// otherwise take a new address for every request.
+fn limited_as(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_ipv6_by_its_64() {
+        let limiter = RateLimiter::default();
+        let ip = |s: &str| ClientIp(Some(s.parse().unwrap()));
+        assert!(limiter.check("x", &ip("2001:db8:1:2::1"), 1).is_ok());
+        assert!(limiter.check("x", &ip("2001:db8:1:2:ffff::9"), 1).is_err());
+        assert!(limiter.check("x", &ip("2001:db8:1:3::1"), 1).is_ok());
+        assert!(limiter.check("x", &ip("1.2.3.4"), 1).is_ok());
+        assert!(limiter.check("x", &ip("::ffff:1.2.3.4"), 1).is_err());
+    }
 
     fn app(extra: &str) -> App {
         let yaml = format!("origin: https://ai.example.com\ndatabase: unused.sqlite3\nproviders: {{}}\nmodels: {{}}\n{extra}");

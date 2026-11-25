@@ -126,6 +126,16 @@ pub struct Bitcoin {
     /// credits it from the mempool, where it can still be double-spent.
     #[serde(default = "default_confirmations")]
     pub confirmations: u32,
+    /// The most bitcoin payments that may be open at once, everyone's
+    /// together. Each takes the next address, and accounts are free to
+    /// make, so this bounds how fast anyone can use up addresses (and the
+    /// wallet's gap limit): at most this many a day.
+    #[serde(default = "default_max_pending")]
+    pub max_pending: u32,
+}
+
+fn default_max_pending() -> u32 {
+    200
 }
 
 /// Our own Esplora, on our own node: what mainnet payments are checked

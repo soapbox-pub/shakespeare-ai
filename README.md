@@ -42,8 +42,10 @@ Stripe's webhook goes to `https://<origin>/webhooks/stripe`, subscribed to
   links.
 - `import-legacy DIR`: import the old service's database (see below).
 
-An account may start 10 payments an hour, and an IP 30, since each is a
-Stripe session, an invoice, or a bitcoin address watched for a week. Pending
+An account may start 10 payments an hour, and an IP 30 (an IPv6 one counted
+by its /64), since each is a Stripe session, an invoice, or a bitcoin address
+watched for a week. Bitcoin payments are capped by how many are open at once
+as well (see below), since accounts are free to make. Pending
 payments are checked on 8 at a time, and a provider that takes more than 15
 seconds to answer is given up on until the next poll.
 
@@ -171,23 +173,36 @@ service holds no private key; the money lands in the wallet the key came
 from. Addresses are native segwit (`bc1q…`), and the payment's `url` is a
 BIP21 `bitcoin:` URI with the amount, for a QR code.
 
-Payments are confirmed by polling an Esplora API once a minute: ours,
+Payments are confirmed by polling an Esplora API: ours,
 `https://btc.soapbox.pub/api`, on our own node, unless `esplora` says
 otherwise. (Its answers decide what's credited, so point it only at a server
-you trust. Public ones such as mempool.space's rate-limit.) They're
-credited once the sats asked for are `confirmations` blocks deep (1 by
-default; 0 trusts the mempool, where a payment can still be double-spent).
+you trust. Public ones such as mempool.space's rate-limit.) A transaction
+counts once it's `confirmations` blocks deep (1 by default; 0 trusts the
+mempool, where a payment can still be double-spent).
 
 - The amount in sats is fixed when the payment is made, at that moment's rate.
+- **What's paid is what's credited.** A payment is credited in proportion to
+  the confirmed sats sent, at its fixed rate, and its fee likewise: paying
+  twice the amount credits twice the credits. Paid in full or more, it's
+  credited at once; paid short, once its time is up, so a top-up before then
+  still counts. Its `amount` and `fee` then say what was credited, and
+  `payments.bitcoin.overpaid` or `.underpaid` is logged.
 - A payment stays payable for a day. One that's been sent something stays
   pending while it confirms, and an address is watched for a week after its
-  payment expires, so late payments still count.
-- **Paying too little credits nothing**, and paying too much credits only
-  what was bought. Both are logged (`payments.bitcoin.underpaid`,
-  `payments.bitcoin.overpaid`), for an operator to settle by hand.
+  payment expires, so late payments still count. Money sent after a payment
+  is credited, or after that week, lands in the wallet uncredited.
+- An address is only asked about when the answer could have changed: every
+  minute while it's open and unpaid; once a block when it's been sent
+  something that isn't deep enough yet; and, past its time with nothing
+  sent, every 5 minutes for an hour, hourly for a day, then every 6 hours.
+- An account may have 3 bitcoin payments open at once, and everyone
+  together `max_pending` (200 by default); past that, a new one is refused
+  with a 503 until some are paid or expire. That bounds how fast addresses
+  can be used up: no more than `max_pending` a day.
 - Unpaid payments leave unused addresses, so the wallet must look further
   ahead than the usual gap limit of 20 to see everything. Raise it (Sparrow:
-  Settings → Gap limit), or the wallet won't show some payments.
+  Settings → Gap limit) well past `max_pending`, or the wallet won't show
+  some payments. (The service still credits them.)
 - Indexes are counted per account key, so changing the key starts again at 0.
 - Don't use the key for anything else that hands out receive addresses, or
   the two will reuse each other's.

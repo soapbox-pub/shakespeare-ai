@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -199,4 +199,18 @@ CREATE TABLE holds (
 ) STRICT;
 
 CREATE INDEX holds_pubkey ON holds (pubkey, amount);
+"#;
+
+/// What each bitcoin address had received when last looked at, so it's only
+/// looked at again when the answer could have changed, and what was credited.
+const BITCOIN_CHECKS: &str = r#"
+-- Sats sent to the address, the mempool included, at the last check.
+ALTER TABLE bitcoin_addresses ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;
+-- When it was last checked, and the best block's height then. NULL: never.
+ALTER TABLE bitcoin_addresses ADD COLUMN checked_at INTEGER;
+ALTER TABLE bitcoin_addresses ADD COLUMN checked_height INTEGER;
+-- The confirmed sats the payment was credited for, more or less than `sats`.
+ALTER TABLE bitcoin_addresses ADD COLUMN paid INTEGER;
+
+CREATE INDEX payments_open ON payments (method, status, expires_at, pubkey);
 "#;

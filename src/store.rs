@@ -242,17 +242,76 @@ pub fn insert_bitcoin_address(conn: &Connection, payment_id: &str, xpub: &str, i
     Ok(())
 }
 
-/// Bitcoin payments to look in on, with the sats each is owed: those
+/// A watched bitcoin address: what it's owed, and what it had when last
+/// checked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BitcoinWatch {
+    pub sats: u64,
+    pub seen: u64,
+    pub checked_at: Option<i64>,
+    pub checked_height: Option<u64>,
+}
+
+/// Bitcoin payments to look in on, with each address's state: those
 /// pending, and those that expired within `grace` seconds, in case they're
 /// paid late.
-pub fn bitcoin_to_watch(conn: &Connection, now: i64, grace: i64) -> Result<Vec<(Payment, u64)>> {
+pub fn bitcoin_to_watch(conn: &Connection, now: i64, grace: i64) -> Result<Vec<(Payment, BitcoinWatch)>> {
     let columns = PAYMENT_COLUMNS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ");
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {columns}, b.sats FROM payments p JOIN bitcoin_addresses b ON b.payment_id = p.id
-         WHERE p.method = 'bitcoin' AND (p.status = 'pending' OR (p.status = 'expired' AND p.expires_at > ?))"
+        "SELECT {columns}, b.sats, b.seen, b.checked_at, b.checked_height FROM payments p JOIN bitcoin_addresses b ON b.payment_id = p.id
+         WHERE p.method = 'bitcoin' AND (p.status = 'pending' OR (p.status = 'expired' AND p.expires_at > ?))
+         ORDER BY b.xpub, b.idx"
     ))?;
-    let rows = stmt.query_map([now - grace], |r| Ok((payment_row(r)?, r.get::<_, i64>(11)? as u64)))?;
+    let rows = stmt.query_map([now - grace], |r| {
+        let watch = BitcoinWatch {
+            sats: r.get::<_, i64>(11)? as u64,
+            seen: r.get::<_, i64>(12)? as u64,
+            checked_at: r.get(13)?,
+            checked_height: r.get::<_, Option<i64>>(14)?.map(|h| h as u64),
+        };
+        Ok((payment_row(r)?, watch))
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Note what an address had at a check, and when.
+pub fn record_bitcoin_check(conn: &Connection, payment_id: &str, seen: u64, now: i64, height: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE bitcoin_addresses SET seen = ?2, checked_at = ?3, checked_height = ?4 WHERE payment_id = ?1",
+        params![payment_id, i64::try_from(seen)?, now, i64::try_from(height)?],
+    )?;
+    Ok(())
+}
+
+/// Complete a bitcoin payment for what was actually paid: its credits and
+/// fee become `amount` and `fee`, and `paid` sats are recorded. Credits move
+/// once, as for any payment.
+pub fn complete_bitcoin_payment(conn: &mut Connection, id: &str, now: i64, amount: Money, fee: Money, paid: u64) -> Result<bool> {
+    let tx = write_tx(conn)?;
+    let pubkey: Option<String> = tx
+        .query_row(
+            "UPDATE payments SET status = 'completed', completed_at = ?2, amount = ?3, fee = ?4
+             WHERE id = ?1 AND method = 'bitcoin' AND status IN ('pending', 'expired') RETURNING pubkey",
+            params![id, now, amount.nanos(), fee.nanos()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(pubkey) = pubkey else {
+        return Ok(false);
+    };
+    tx.execute("UPDATE bitcoin_addresses SET paid = ?2 WHERE payment_id = ?1", params![id, i64::try_from(paid)?])?;
+    post(&tx, &pubkey, amount, Kind::Payment, id, now)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Bitcoin payments still open to be paid, by one account or by everyone.
+pub fn open_bitcoin_payments(conn: &Connection, pubkey: Option<&str>, now: i64) -> Result<u32> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM payments WHERE method = 'bitcoin' AND status = 'pending' AND expires_at > ?1 AND (?2 IS NULL OR pubkey = ?2)",
+        params![now, pubkey],
+        |r| r.get(0),
+    )?)
 }
 
 /// Expire every pending Stripe payment past its time; Stripe's own session
@@ -892,7 +951,13 @@ mod tests {
             let ids = |now| -> Result<Vec<String>> { Ok(bitcoin_to_watch(conn, now, 50)?.into_iter().map(|(p, _)| p.id).collect()) };
             assert_eq!(ids(100)?, ["pi_1", "pi_2"]);
             assert_eq!(ids(200)?, ["pi_1"]);
-            assert_eq!(bitcoin_to_watch(conn, 0, 50)?[0].1, 1000);
+            assert_eq!(bitcoin_to_watch(conn, 0, 50)?[0].1, BitcoinWatch { sats: 1000, ..BitcoinWatch::default() });
+            record_bitcoin_check(conn, "pi_1", 400, 7, 800_000)?;
+            let watch = &bitcoin_to_watch(conn, 0, 50)?[0].1;
+            assert_eq!((watch.seen, watch.checked_at, watch.checked_height), (400, Some(7), Some(800_000)));
+            assert_eq!(open_bitcoin_payments(conn, None, 0)?, 1);
+            assert_eq!(open_bitcoin_payments(conn, Some("nobody"), 0)?, 0);
+            assert_eq!(open_bitcoin_payments(conn, None, 100)?, 0);
             Ok(())
         })
         .unwrap();

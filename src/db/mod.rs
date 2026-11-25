@@ -218,7 +218,7 @@ mod tests {
             conn.query_row("SELECT method, fee, provider_ref, completed_at FROM payments WHERE id = 'pi_1'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
         assert_eq!(row, ("lightning".into(), 1, Some("https://v".into()), Some(2)));
         let indexes: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'payments' AND name LIKE 'payments_%'", [], |r| r.get(0)).unwrap();
-        assert_eq!(indexes, 2);
+        assert_eq!(indexes, 3);
         conn.execute("INSERT INTO payments (id, pubkey, method, status, amount, fee, url, created_at, expires_at) VALUES ('pi_2', 'a', 'bitcoin', 'pending', 1, 0, 'bitcoin:x', 1, 2)", []).unwrap();
     }
 }

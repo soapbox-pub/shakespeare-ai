@@ -44,6 +44,10 @@ payments:
     # esplora: https://btc.soapbox.pub/api
     # How many blocks deep a payment must be before it's credited.
     confirmations: 1
+    # The most bitcoin payments open at once, everyone's together; each
+    # takes an address, so at most this many are used up a day. (An account
+    # may have 3.)
+    max_pending: 200
 
 # How hard to try a model's upstreams. A request falls over to the next one
 # when an upstream can't be reached, is overloaded or down (408, 429, 5xx),

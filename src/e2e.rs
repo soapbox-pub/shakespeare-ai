@@ -780,15 +780,64 @@ async fn sells_credits_for_onchain_bitcoin() {
     assert_eq!(status_of(first_id), "completed");
     assert_eq!(balance(&app), Money(10_000_000_000));
 
-    // Short by a sat: never credited.
-    esplora.pay(SECOND, 10_999, Some(800_000));
+    // Short by half: not yet, as a top-up could still come; once its time is
+    // up, credited for what was paid.
+    esplora.pay(SECOND, 5_500, Some(800_000));
     crate::payments::check_bitcoin_payments(&app).await.unwrap();
     assert_eq!(status_of(second_id), "pending");
     assert_eq!(balance(&app), Money(10_000_000_000));
+    app.db.with(|conn| Ok(conn.execute("UPDATE payments SET expires_at = 1 WHERE id = ?", [second_id])?)).unwrap();
+    // Nothing new until there's another block.
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(second_id), "pending");
+    *esplora.tip.lock() = 800_002;
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(second_id), "completed");
+    assert_eq!(balance(&app), Money(15_000_000_000));
+
+    // Paid double: credited double, at once.
+    let (_, third) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
+    let third_address = crate::payments::bitcoin::Wallet::parse(ZPUB).unwrap().address(2).unwrap();
+    esplora.pay(&third_address, 22_000, Some(800_000));
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(status_of(third["id"].as_str().unwrap()), "completed");
+    assert_eq!(balance(&app), Money(35_000_000_000));
 
     let (_, list) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits/payments?method=bitcoin", None)).await.unwrap()).await;
-    assert_eq!(list["data"].as_array().unwrap().len(), 2);
-    assert_eq!(list["data"][0]["description"], "Credit purchase via Bitcoin");
+    let data = list["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    assert_eq!(data[0]["description"], "Credit purchase via Bitcoin");
+    // Each says what it was credited for.
+    let listed = |id: &Value| data.iter().find(|p| &p["id"] == id).map(|p| (p["amount"].clone(), p["fee"].clone())).unwrap();
+    assert_eq!(listed(&third["id"]), (json!(20.0), json!(2.0)));
+    assert_eq!(listed(&second["id"]), (json!(5.0), json!(0.5)));
+}
+
+#[tokio::test]
+async fn caps_open_bitcoin_payments() {
+    use crate::payments::bitcoin::tests::{FakeEsplora, ZPUB};
+    let base = FakeEsplora::default().serve().await;
+    let yaml = format!("origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  bitcoin:\n    xpub: {ZPUB}\n    esplora: {base}\n    max_pending: 4\nproviders: {{}}\nmodels: {{}}\n");
+    let t = temp_db();
+    let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
+    app.rates.set(rust_decimal::Decimal::from(100_000));
+    let body = serde_json::to_vec(&json!({ "amount": 10, "method": "bitcoin" })).unwrap();
+    let add = |secret: &str| {
+        let auth = sign_nip98(secret, "POST", "https://ai.example.com/v1/credits/add", Some(&body), crate::util::now());
+        Request::builder().method("POST").uri("/v1/credits/add").header("authorization", auth).header("content-type", "application/json").body(Body::from(body.clone())).unwrap()
+    };
+    let other = "0000000000000000000000000000000000000000000000000000000000000009";
+
+    // Three open at once per account.
+    for _ in 0..3 {
+        assert_eq!(router(app.clone()).oneshot(add(SECRET)).await.unwrap().status(), StatusCode::OK);
+    }
+    let (status, body) = json_of(router(app.clone()).oneshot(add(SECRET)).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_open_payments")));
+    // And `max_pending` for everyone.
+    assert_eq!(router(app.clone()).oneshot(add(other)).await.unwrap().status(), StatusCode::OK);
+    let (status, body) = json_of(router(app.clone()).oneshot(add(other)).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::SERVICE_UNAVAILABLE, &json!("bitcoin_busy")));
 }
 
 #[tokio::test]
@@ -802,6 +851,8 @@ async fn limits_the_payments_an_account_starts() {
     let add = || signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "bitcoin" })));
     for _ in 0..10 {
         assert_eq!(router(app.clone()).oneshot(add()).await.unwrap().status(), StatusCode::OK);
+        // Expired, so only the hourly limit is in the way, not the open one.
+        app.db.with(|conn| Ok(conn.execute("UPDATE payments SET status = 'expired'", [])?)).unwrap();
     }
     let (status, body) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
     assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_payments")));

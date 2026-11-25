@@ -45,6 +45,8 @@ pub async fn methods(State(app): State<Arc<App>>) -> Json<Value> {
 /// they mustn't be free to make by the thousand.
 const PAYMENTS_PER_ACCOUNT: u32 = 10;
 const PAYMENTS_PER_IP: u32 = 30;
+/// Bitcoin payments one account may have open at once.
+const OPEN_BITCOIN_PER_ACCOUNT: u32 = 3;
 
 pub async fn add(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
     app.limiter.check("payments", &ip, PAYMENTS_PER_IP)?;
@@ -87,6 +89,29 @@ pub async fn add(State(app): State<Arc<App>>, Extension(ip): Extension<ClientIp>
     };
     if !configured {
         return Err(unsupported());
+    }
+    if let (PaymentMethod::Bitcoin, Some(bitcoin)) = (payment_method, &app.config.payments.bitcoin) {
+        let (who, now) = (pubkey.clone(), crate::util::now());
+        let (mine, everyone) = app
+            .db
+            .call(move |conn| Ok((store::open_bitcoin_payments(conn, Some(&who), now)?, store::open_bitcoin_payments(conn, None, now)?)))
+            .await?;
+        if mine >= OPEN_BITCOIN_PER_ACCOUNT {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "too_many_open_payments",
+                format!("You have {mine} bitcoin payments waiting to be paid. Pay one of them, or wait for them to expire."),
+            ));
+        }
+        if everyone >= bitcoin.max_pending {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "bitcoin_busy",
+                "Too many bitcoin payments are waiting to be paid right now. Try again later, or pay another way.",
+            ));
+        }
     }
 
     let redirect_url = match request.get("redirect_url") {
