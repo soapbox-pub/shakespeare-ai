@@ -221,8 +221,8 @@ mempool, where a payment can still be double-spent).
   every other, so payments checked at once can't overshoot. A new account
   always waits for its confirmation, and new pubkeys earn nothing.
 - An advance isn't a ledger entry: like a hold, it only changes what can be
-  spent on inference (gift cards are bought from the balance alone, so it
-  can't be moved to another account). When the payment is credited, the
+  spent on inference (gift cards are bought from the balance less what's
+  held, without advances, so it can't be moved to another account). When the payment is credited, the
   credit takes its place. An address with an advance is checked every
   minute; if what was sent to it shrinks (a transaction replaced or dropped),
   or it's still unconfirmed when its week of watching is up, the advance is

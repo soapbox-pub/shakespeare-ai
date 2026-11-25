@@ -676,7 +676,10 @@ pub fn create_giftcards(
     let tx = write_tx(conn)?;
     let required = amount.checked_mul(i64::from(quantity)).unwrap_or(Money(i64::MAX));
     if charge {
-        let available = balance(&tx, sender)?;
+        // What's held for requests in flight is spoken for: bought with,
+        // it would be charged again when they finish, and a card would carry
+        // credit its sender no longer has to another account.
+        let available = Money(balance(&tx, sender)?.nanos().saturating_sub(held(&tx, sender)?));
         if available < required {
             return Ok(Err(GiftcardError::Insufficient { required, available }));
         }
@@ -832,13 +835,18 @@ pub fn record_generation(conn: &mut Connection, g: &Generation, hold: Option<&st
 
 // Holds.
 
+/// What's held for an account's requests in flight, in nanodollars.
+fn held(conn: &Connection, pubkey: &str) -> Result<i64> {
+    Ok(conn.query_row("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE pubkey = ?", [pubkey], |r| r.get(0))?)
+}
+
 /// What an account can spend on inference now: its balance, plus what's
 /// advanced on its bitcoin payments that haven't confirmed, less what's held
-/// for its requests in flight. (Gift cards are bought from the balance
-/// alone, so an advance can't be moved to another account.)
+/// for its requests in flight. (Gift cards are bought from the balance less
+/// what's held, without advances, so an advance can't be moved to another
+/// account.)
 pub fn spendable(conn: &Connection, pubkey: &str) -> Result<Money> {
-    let held: i64 = conn.query_row("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE pubkey = ?", [pubkey], |r| r.get(0))?;
-    Ok(Money(balance(conn, pubkey)?.nanos().saturating_add(advances(conn, pubkey)?.nanos()).saturating_sub(held)))
+    Ok(Money(balance(conn, pubkey)?.nanos().saturating_add(advances(conn, pubkey)?.nanos()).saturating_sub(held(conn, pubkey)?)))
 }
 
 /// Set `amount` aside for a request, if the account can spend that much and
@@ -1514,6 +1522,27 @@ mod tests {
             let (ledger, cached): (i64, i64) =
                 conn.query_row("SELECT (SELECT SUM(amount) FROM ledger), (SELECT SUM(balance) FROM accounts)", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
             assert_eq!(ledger, cached);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn buys_gift_cards_only_with_credit_not_held() {
+        let t = temp_db();
+        t.db.with(|conn| {
+            pay(conn, "pi_1", DOLLAR.checked_mul(10).unwrap());
+            complete_payment(conn, "pi_1", 1)?;
+            let five = DOLLAR.checked_mul(5).unwrap();
+            // A request in flight holds $6 of the $10: what it will be charged
+            // can't be given away on a card before it is.
+            let hold = place_hold(conn, ALICE, DOLLAR.checked_mul(6).unwrap(), 2)?.unwrap();
+            assert_eq!(
+                create_giftcards(conn, ALICE, five, 1, true, 2)?.unwrap_err(),
+                GiftcardError::Insufficient { required: five, available: DOLLAR.checked_mul(4).unwrap() }
+            );
+            release_hold(conn, &hold)?;
+            assert_eq!(create_giftcards(conn, ALICE, five, 1, true, 3)?.unwrap().len(), 1);
             Ok(())
         })
         .unwrap();
