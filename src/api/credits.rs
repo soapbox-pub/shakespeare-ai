@@ -16,8 +16,10 @@ use crate::store::{self, Method as PaymentMethod};
 
 pub async fn balance(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let pubkey = app.authenticate(&method, &uri, &headers, b"")?;
-    let amount = app.db.call(move |conn| store::balance(conn, &pubkey)).await?;
-    Ok(Json(json!({ "object": "credits", "amount": amount.to_f64() })))
+    let who = pubkey.clone();
+    let amount = app.db.call(move |conn| store::balance(conn, &who)).await?;
+    let pending = crate::payments::pending_credits(&app, &pubkey).await?;
+    Ok(Json(json!({ "object": "credits", "amount": amount.to_f64(), "pending": pending.to_f64() })))
 }
 
 /// What a client can buy credits with, and on what terms. Public: it's the
@@ -150,15 +152,22 @@ pub async fn get_payment(State(app): State<Arc<App>>, Path(id): Path<String>, me
     };
     let payment = lookup(&app, id.clone()).await?.filter(|p| p.pubkey == pubkey).ok_or_else(not_found)?;
 
-    // Asking about a pending Lightning payment checks on it now, rather than
-    // waiting for the next poll; but not more than every few seconds.
-    if payment.status == "pending" && payment.method == PaymentMethod::Lightning && app.not_since(&payment.id, std::time::Duration::from_secs(5)) {
-        if let Err(error) = crate::payments::check_lightning(&app, &payment).await {
-            crate::log::warn("payments.lightning", json!({ "id": payment.id, "error": format!("{error:#}") }));
+    // Asking about a payment we check on ourselves checks on it now, rather
+    // than waiting for the next poll; but not more than every few seconds.
+    // (A bitcoin one may have expired and still be paid late.)
+    let checked = match payment.method {
+        PaymentMethod::Lightning if payment.status == "pending" && app.not_since(&payment.id, std::time::Duration::from_secs(5)) => {
+            crate::payments::check_lightning(&app, &payment).await.map_err(|e| ("payments.lightning", e))
         }
-        let payment = lookup(&app, id.clone()).await?.ok_or_else(not_found)?;
-        return Ok(Json(tagged("payment", payment)));
+        PaymentMethod::Bitcoin if payment.status != "completed" && app.not_since(&payment.id, std::time::Duration::from_secs(10)) => {
+            crate::payments::check_bitcoin_now(&app, &payment.id).await.map_err(|e| ("payments.bitcoin", e))
+        }
+        _ => return Ok(Json(tagged("payment", payment))),
+    };
+    if let Err((ns, error)) = checked {
+        crate::log::warn(ns, json!({ "id": payment.id, "error": format!("{error:#}") }));
     }
+    let payment = lookup(&app, id.clone()).await?.ok_or_else(not_found)?;
     Ok(Json(tagged("payment", payment)))
 }
 

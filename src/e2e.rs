@@ -666,7 +666,7 @@ async fn sells_and_redeems_gift_cards() {
     assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("giftcard_already_redeemed")));
 
     let (_, body) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits", None)).await.unwrap()).await;
-    assert_eq!(body, json!({ "object": "credits", "amount": 12.0 }));
+    assert_eq!(body, json!({ "object": "credits", "amount": 12.0, "pending": 0.0 }));
 
     // A cancelled card is refunded, and listed as cancelled.
     let (_, body) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/giftcards", Some(json!({ "amount": 5 })))).await.unwrap()).await;
@@ -749,6 +749,7 @@ async fn sells_credits_for_onchain_bitcoin() {
     assert_eq!(first["total"], 11.0);
     // $11 at $100,000/BTC.
     assert_eq!(first["url"], format!("bitcoin:{FIRST}?amount=0.00011&label=Shakespeare%20AI%20Credits"));
+    assert_eq!(first["bitcoin"], json!({ "sats": 11_000, "received": 0 }));
     let (_, second) = json_of(router(app.clone()).oneshot(add()).await.unwrap()).await;
     assert!(second["url"].as_str().unwrap().starts_with(&format!("bitcoin:{SECOND}?")));
 
@@ -765,10 +766,15 @@ async fn sells_credits_for_onchain_bitcoin() {
     let first_id = first["id"].as_str().unwrap();
     let second_id = second["id"].as_str().unwrap();
 
-    // In the mempool, then one block deep: not yet.
+    // In the mempool: seen as soon as it's asked about, and pending in the
+    // balance, but not yet credited.
     esplora.pay(FIRST, 11_000, None);
-    crate::payments::check_bitcoin_payments(&app).await.unwrap();
-    assert_eq!(status_of(first_id), "pending");
+    let get = |uri: &str| signed("GET", uri, None);
+    let (_, payment) = json_of(router(app.clone()).oneshot(get(&format!("/v1/credits/payments/{first_id}"))).await.unwrap()).await;
+    assert_eq!((&payment["status"], &payment["bitcoin"]), (&json!("pending"), &json!({ "sats": 11_000, "received": 11_000 })));
+    let (_, credits) = json_of(router(app.clone()).oneshot(get("/v1/credits")).await.unwrap()).await;
+    assert_eq!((credits["amount"].as_f64(), credits["pending"].as_f64()), (Some(0.0), Some(10.0)));
+    // Then one block deep: not yet.
     esplora.txs.lock().clear();
     esplora.pay(FIRST, 11_000, Some(800_000));
     crate::payments::check_bitcoin_payments(&app).await.unwrap();
@@ -779,6 +785,8 @@ async fn sells_credits_for_onchain_bitcoin() {
     crate::payments::check_bitcoin_payments(&app).await.unwrap();
     assert_eq!(status_of(first_id), "completed");
     assert_eq!(balance(&app), Money(10_000_000_000));
+    let (_, credits) = json_of(router(app.clone()).oneshot(get("/v1/credits")).await.unwrap()).await;
+    assert_eq!((credits["amount"].as_f64(), credits["pending"].as_f64()), (Some(10.0), Some(0.0)));
 
     // Short by half: not yet, as a top-up could still come; once its time is
     // up, credited for what was paid.

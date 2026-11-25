@@ -195,6 +195,12 @@ mempool, where a payment can still be double-spent).
   minute while it's open and unpaid; once a block when it's been sent
   something that isn't deep enough yet; and, past its time with nothing
   sent, every 5 minutes for an hour, hourly for a day, then every 6 hours.
+  Asking for a payment (`GET /v1/credits/payments/{id}`) also checks its
+  address then, at most every 10 seconds, so the dashboard sees money reach
+  the mempool at once.
+- What's been sent shows before it's credited: a payment's `bitcoin` has the
+  `sats` it asks for and the sats `received`, the mempool included, and the
+  balance's `pending` is what's on its way, valued as it will be credited.
 - An account may have 3 bitcoin payments open at once, and everyone
   together `max_pending` (200 by default); past that, a new one is refused
   with a 503 until some are paid or expire. That bounds how fast addresses

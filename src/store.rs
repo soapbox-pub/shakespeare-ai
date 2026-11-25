@@ -111,6 +111,18 @@ pub struct Payment {
     pub pubkey: String,
     #[serde(skip)]
     pub provider_ref: Option<String>,
+    /// A bitcoin payment's sats: what it asked for, and what's been seen
+    /// sent to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitcoin: Option<BitcoinSats>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BitcoinSats {
+    /// What it asked for, at the rate when it was made.
+    pub sats: u64,
+    /// What's been sent, the mempool included, at the last check.
+    pub received: u64,
 }
 
 pub struct NewPayment<'a> {
@@ -138,7 +150,12 @@ pub fn insert_payment(conn: &Connection, p: &NewPayment) -> Result<()> {
     Ok(())
 }
 
-const PAYMENT_COLUMNS: &str = "id, pubkey, method, status, amount, fee, url, provider_ref, created_at, completed_at, expires_at";
+/// A payment's columns, read by [`payment_row`] from [`PAYMENTS`].
+const PAYMENT_COLUMNS: &str =
+    "p.id, p.pubkey, p.method, p.status, p.amount, p.fee, p.url, p.provider_ref, p.created_at, p.completed_at, p.expires_at, b.sats, b.seen";
+
+/// Payments, with a bitcoin payment's address. (No column names are shared.)
+const PAYMENTS: &str = "payments p LEFT JOIN bitcoin_addresses b ON b.payment_id = p.id";
 
 fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
     let method = Method::parse(&row.get::<_, String>(2)?).unwrap_or(Method::Stripe);
@@ -162,11 +179,15 @@ fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
         created_at: row.get(8)?,
         completed_at: row.get(9)?,
         expires_at: row.get(10)?,
+        bitcoin: match row.get::<_, Option<i64>>(11)? {
+            Some(sats) => Some(BitcoinSats { sats: sats as u64, received: row.get::<_, i64>(12)? as u64 }),
+            None => None,
+        },
     })
 }
 
 pub fn get_payment(conn: &Connection, id: &str) -> Result<Option<Payment>> {
-    Ok(conn.query_row(&format!("SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = ?"), [id], payment_row).optional()?)
+    Ok(conn.query_row(&format!("SELECT {PAYMENT_COLUMNS} FROM {PAYMENTS} WHERE p.id = ?"), [id], payment_row).optional()?)
 }
 
 pub fn list_payments(
@@ -180,7 +201,7 @@ pub fn list_payments(
     let cursor = starting_after.map(|id| cursor_of(conn, "payments", "pubkey", pubkey, id)).transpose()?.flatten();
     let (after_time, after_id) = cursor.unzip();
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {PAYMENT_COLUMNS} FROM payments
+        "SELECT {PAYMENT_COLUMNS} FROM {PAYMENTS}
          WHERE pubkey = ?1 AND (?2 IS NULL OR (created_at, id) < (?2, ?3)) AND (?4 IS NULL OR status = ?4) AND (?5 IS NULL OR method = ?5)
          ORDER BY created_at DESC, id DESC LIMIT ?6"
     ))?;
@@ -223,7 +244,7 @@ pub fn expire_payment(conn: &Connection, id: &str) -> Result<()> {
 
 /// Pending payments whose method we check on ourselves (Lightning).
 pub fn pending_lightning(conn: &Connection) -> Result<Vec<Payment>> {
-    let mut stmt = conn.prepare_cached(&format!("SELECT {PAYMENT_COLUMNS} FROM payments WHERE status = 'pending' AND method = 'lightning'"))?;
+    let mut stmt = conn.prepare_cached(&format!("SELECT {PAYMENT_COLUMNS} FROM {PAYMENTS} WHERE status = 'pending' AND method = 'lightning'"))?;
     let rows = stmt.query_map([], payment_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
@@ -254,24 +275,31 @@ pub struct BitcoinWatch {
 
 /// Bitcoin payments to look in on, with each address's state: those
 /// pending, and those that expired within `grace` seconds, in case they're
-/// paid late.
-pub fn bitcoin_to_watch(conn: &Connection, now: i64, grace: i64) -> Result<Vec<(Payment, BitcoinWatch)>> {
-    let columns = PAYMENT_COLUMNS.split(", ").map(|c| format!("p.{c}")).collect::<Vec<_>>().join(", ");
+/// paid late. Everyone's, or one account's.
+pub fn bitcoin_to_watch(conn: &Connection, pubkey: Option<&str>, now: i64, grace: i64) -> Result<Vec<(Payment, BitcoinWatch)>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {columns}, b.sats, b.seen, b.checked_at, b.checked_height FROM payments p JOIN bitcoin_addresses b ON b.payment_id = p.id
-         WHERE p.method = 'bitcoin' AND (p.status = 'pending' OR (p.status = 'expired' AND p.expires_at > ?))
+        "SELECT {PAYMENT_COLUMNS}, b.checked_at, b.checked_height FROM {PAYMENTS}
+         WHERE p.method = 'bitcoin' AND (p.status = 'pending' OR (p.status = 'expired' AND p.expires_at > ?1)) AND (?2 IS NULL OR p.pubkey = ?2)
          ORDER BY b.xpub, b.idx"
     ))?;
-    let rows = stmt.query_map([now - grace], |r| {
-        let watch = BitcoinWatch {
-            sats: r.get::<_, i64>(11)? as u64,
-            seen: r.get::<_, i64>(12)? as u64,
-            checked_at: r.get(13)?,
-            checked_height: r.get::<_, Option<i64>>(14)?.map(|h| h as u64),
-        };
-        Ok((payment_row(r)?, watch))
-    })?;
+    let rows = stmt.query_map(params![now - grace, pubkey], watch_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One bitcoin payment, with its address's state.
+pub fn bitcoin_watch(conn: &Connection, id: &str) -> Result<Option<(Payment, BitcoinWatch)>> {
+    let sql = format!("SELECT {PAYMENT_COLUMNS}, b.checked_at, b.checked_height FROM {PAYMENTS} WHERE p.id = ? AND b.payment_id IS NOT NULL");
+    Ok(conn.query_row(&sql, [id], watch_row).optional()?)
+}
+
+fn watch_row(r: &rusqlite::Row) -> rusqlite::Result<(Payment, BitcoinWatch)> {
+    let watch = BitcoinWatch {
+        sats: r.get::<_, i64>(11)? as u64,
+        seen: r.get::<_, i64>(12)? as u64,
+        checked_at: r.get(13)?,
+        checked_height: r.get::<_, Option<i64>>(14)?.map(|h| h as u64),
+    };
+    Ok((payment_row(r)?, watch))
 }
 
 /// Note what an address had at a check, and when.
@@ -948,13 +976,16 @@ mod tests {
 
             expire_payment(conn, "pi_2")?;
             expire_payment(conn, "pi_3")?;
-            let ids = |now| -> Result<Vec<String>> { Ok(bitcoin_to_watch(conn, now, 50)?.into_iter().map(|(p, _)| p.id).collect()) };
+            let ids = |now| -> Result<Vec<String>> { Ok(bitcoin_to_watch(conn, None, now, 50)?.into_iter().map(|(p, _)| p.id).collect()) };
             assert_eq!(ids(100)?, ["pi_1", "pi_2"]);
             assert_eq!(ids(200)?, ["pi_1"]);
-            assert_eq!(bitcoin_to_watch(conn, 0, 50)?[0].1, BitcoinWatch { sats: 1000, ..BitcoinWatch::default() });
+            assert_eq!(bitcoin_to_watch(conn, None, 0, 50)?[0].1, BitcoinWatch { sats: 1000, ..BitcoinWatch::default() });
             record_bitcoin_check(conn, "pi_1", 400, 7, 800_000)?;
-            let watch = &bitcoin_to_watch(conn, 0, 50)?[0].1;
+            let watch = &bitcoin_to_watch(conn, None, 0, 50)?[0].1;
             assert_eq!((watch.seen, watch.checked_at, watch.checked_height), (400, Some(7), Some(800_000)));
+            assert_eq!(get_payment(conn, "pi_1")?.unwrap().bitcoin, Some(BitcoinSats { sats: 1000, received: 400 }));
+            assert_eq!(bitcoin_watch(conn, "pi_1")?.unwrap().1.seen, 400);
+            assert!(bitcoin_to_watch(conn, Some("nobody"), 0, 50)?.is_empty());
             assert_eq!(open_bitcoin_payments(conn, None, 0)?, 1);
             assert_eq!(open_bitcoin_payments(conn, Some("nobody"), 0)?, 0);
             assert_eq!(open_bitcoin_payments(conn, None, 100)?, 0);

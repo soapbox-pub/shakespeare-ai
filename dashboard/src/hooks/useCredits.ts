@@ -2,7 +2,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import { useMemo } from 'react';
 
 import { useCurrentUser } from '@/hooks/useCurrentUser';
-import { ApiClient, type List, type Model, type PaymentMethod, type PaymentMethods, publicRequest } from '@/lib/api';
+import { ApiClient, type Credits, isUnsettled, type List, type Model, type Payment, type PaymentMethod, type PaymentMethods, publicRequest } from '@/lib/api';
 
 /**
  * An API client signed in as the current account, or undefined when logged
@@ -19,14 +19,28 @@ export function useAccountKey(): string | undefined {
   return useCurrentUser().user?.pubkey;
 }
 
+/**
+ * The balance. While credit is pending it's checked every half minute, and
+ * the payment history refreshed when what's pending changes, so a bitcoin
+ * payment that confirms shows without a reload.
+ */
 export function useBalance() {
   const api = useApi();
   const pubkey = useAccountKey();
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: ['balance', pubkey],
-    queryFn: () => api!.balance(),
+    queryFn: async () => {
+      const last = queryClient.getQueryData<Credits>(['balance', pubkey]);
+      const credits = await api!.balance();
+      if (last && last.pending !== credits.pending) {
+        void queryClient.invalidateQueries({ queryKey: ['payments', pubkey] });
+      }
+      return credits;
+    },
     enabled: !!api,
     staleTime: 10_000,
+    refetchInterval: (query) => (query.state.data?.pending ? 30_000 : false),
   });
 }
 
@@ -74,18 +88,24 @@ export function usePayment(id: string | undefined, method: PaymentMethod | undef
   return useQuery({
     queryKey: ['payment', pubkey, id],
     queryFn: async () => {
+      const last = queryClient.getQueryData<Payment>(['payment', pubkey, id]);
       const payment = await api!.payment(id!);
-      if (payment.status !== 'pending') {
+      // Paid, expired, or sent bitcoin: the balance and history show it.
+      if (!last || payment.status !== last.status || payment.bitcoin?.received !== last.bitcoin?.received) {
         void queryClient.invalidateQueries({ queryKey: ['balance', pubkey] });
         void queryClient.invalidateQueries({ queryKey: ['payments', pubkey] });
       }
       return payment;
     },
     enabled: !!api && !!id,
-    // Asking about a Lightning payment checks the invoice there and then, so
-    // it's worth asking often. Bitcoin is checked by the server once a
-    // minute, and Stripe by its webhook.
-    refetchInterval: (query) => (query.state.data?.status !== 'pending' ? false : method === 'lightning' ? 3_000 : 15_000),
+    // Asking about a Lightning or bitcoin payment checks on it there and
+    // then (bitcoin's address at most every 10 seconds), so it's worth
+    // asking often. Stripe's is completed by its webhook.
+    refetchInterval: (query) => {
+      const payment = query.state.data;
+      if (payment && !isUnsettled(payment)) return false;
+      return method === 'lightning' ? 3_000 : method === 'bitcoin' ? 10_000 : 15_000;
+    },
     staleTime: 0,
   });
 }

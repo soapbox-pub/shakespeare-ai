@@ -236,7 +236,7 @@ fn bitcoin_check_due(payment: &Payment, watch: &store::BitcoinWatch, now: i64, t
 /// news.
 pub async fn check_bitcoin_payments(app: &App) -> Result<()> {
     let Some(config) = &app.config.payments.bitcoin else { return Ok(()) };
-    let watching = app.db.call(|conn| store::bitcoin_to_watch(conn, crate::util::now(), BITCOIN_GRACE)).await?;
+    let watching = app.db.call(|conn| store::bitcoin_to_watch(conn, None, crate::util::now(), BITCOIN_GRACE)).await?;
     if watching.is_empty() {
         return Ok(());
     }
@@ -251,6 +251,35 @@ pub async fn check_bitcoin_payments(app: &App) -> Result<()> {
         })
         .await;
     Ok(())
+}
+
+/// Look in on one bitcoin payment now, rather than at the next poll, so money
+/// that reaches the mempool shows at once.
+pub async fn check_bitcoin_now(app: &App, id: &str) -> Result<()> {
+    let Some(config) = &app.config.payments.bitcoin else { return Ok(()) };
+    let id = id.to_string();
+    let Some((payment, watch)) = app.db.call(move |conn| store::bitcoin_watch(conn, &id)).await? else { return Ok(()) };
+    if payment.status == "completed" || crate::util::now() > payment.expires_at + BITCOIN_GRACE {
+        return Ok(());
+    }
+    let tip = bitcoin::tip_height(&app.http, &config.esplora()).await.context("couldn't get the block height")?;
+    check_bitcoin(app, config, &payment, &watch, tip).await
+}
+
+/// Credits an account has on their way: what's been sent to its watched
+/// bitcoin payments but isn't yet deep enough to credit, valued as it will
+/// be credited.
+pub async fn pending_credits(app: &App, pubkey: &str) -> Result<Money> {
+    if app.config.payments.bitcoin.is_none() {
+        return Ok(Money::ZERO);
+    }
+    let pubkey = pubkey.to_string();
+    let watching = app.db.call(move |conn| store::bitcoin_to_watch(conn, Some(&pubkey), crate::util::now(), BITCOIN_GRACE)).await?;
+    let mut total = Money::ZERO;
+    for (payment, watch) in watching.iter().filter(|(_, watch)| watch.seen > 0) {
+        total = total.checked_add(pro_rata(payment.amount, watch.seen, watch.sats)?).ok_or(anyhow!("too much pending to count"))?;
+    }
+    Ok(total)
 }
 
 /// Look in on pending payments once a minute.
@@ -359,6 +388,7 @@ mod tests {
             expires_at: 1000,
             pubkey: String::new(),
             provider_ref: None,
+            bitcoin: None,
         };
         let checked = |at: i64, seen: u64| store::BitcoinWatch { sats: 100, seen, checked_at: Some(at), checked_height: Some(10) };
         let (open, expired) = (payment("pending"), payment("expired"));

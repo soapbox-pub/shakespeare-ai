@@ -1,5 +1,5 @@
 import { useSeoMeta } from '@unhead/react';
-import { Gift, Plus, Receipt, ShoppingBag } from 'lucide-react';
+import { Gift, Hourglass, Plus, Receipt, ShoppingBag } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { AddCreditsDialog } from '@/components/AddCreditsDialog';
@@ -14,7 +14,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { useBalance, usePayments } from '@/hooks/useCredits';
-import type { Payment } from '@/lib/api';
+import { isConfirming, type Payment } from '@/lib/api';
 import { dateTime, usd } from '@/lib/format';
 import { codeFromHash } from '@/lib/giftcards';
 
@@ -70,6 +70,15 @@ function Credits() {
               <span className="text-brand">{usd(balance.data.amount)}</span>
             )}
           </div>
+          {balance.data?.pending ? (
+            <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+              <Hourglass className="size-4 text-brand" aria-hidden />
+              <span>
+                <span className="font-medium text-foreground tabular-nums">+{usd(balance.data.pending)}</span> pending, added
+                once your bitcoin confirms
+              </span>
+            </p>
+          ) : null}
           {balance.isError && <p className="text-sm text-destructive">{balance.error.message}</p>}
         </div>
         <div className="flex flex-wrap gap-2">
@@ -138,7 +147,17 @@ function PaymentHistory({ onResume }: { onResume: (payment: Payment) => void }) 
                   <TableCell className="hidden text-right tabular-nums sm:table-cell">{usd(payment.amount)}</TableCell>
                   <TableCell className="text-right tabular-nums">{usd(payment.total)}</TableCell>
                   <TableCell>
-                    {payment.status === 'pending' ? (
+                    {isConfirming(payment) ? (
+                      <button
+                        type="button"
+                        className="rounded-md focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                        onClick={() => onResume(payment)}
+                      >
+                        <Badge variant="secondary">
+                          <Hourglass className="size-3" aria-hidden /> Confirming
+                        </Badge>
+                      </button>
+                    ) : payment.status === 'pending' ? (
                       <Button variant="link" size="sm" className="h-auto p-0" onClick={() => onResume(payment)}>
                         Pay now
                       </Button>

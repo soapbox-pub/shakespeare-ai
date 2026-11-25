@@ -123,6 +123,9 @@ function BalanceCard() {
       <div className="mt-1 text-xl font-semibold tracking-tight tabular-nums">
         {balance.isPending ? <Skeleton className="h-7 w-24" /> : balance.isError ? '—' : usd(balance.data.amount)}
       </div>
+      {balance.data?.pending ? (
+        <div className="text-xs text-muted-foreground tabular-nums">+{usd(balance.data.pending)} pending</div>
+      ) : null}
     </Link>
   );
 }

@@ -187,11 +187,15 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
 
             <h3>Get Credit Balance</h3>
             <Endpoint method="GET" path="/v1/credits" />
-            <p>Retrieves the user's current credit balance.</p>
+            <p>
+              Retrieves the user's current credit balance. <code>pending</code> is credit on its way: bitcoin that's been
+              sent, the mempool included, but isn't yet confirmed deep enough to spend.
+            </p>
             <h4>Response</h4>
             <Code>{`{
   "object": "credits",
-  "amount": 10.50
+  "amount": 10.50,
+  "pending": 0
 }`}</Code>
 
             <h3>List Payment Methods</h3>
@@ -239,6 +243,8 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
               address and the amount, such as <code>bitcoin:bc1q...?amount=0.00011</code>; it completes once the transaction
               confirms. What's sent is what's credited: paying more credits more, and paying less credits less once the
               payment expires (a top-up before then still counts). An account may have 3 bitcoin payments open at once.
+              A Bitcoin payment also has <code>bitcoin</code>: the <code>sats</code> it asks for, and the sats{' '}
+              <code>received</code> so far, the mempool included, so a client can show it's been paid while it confirms.
             </p>
             <h4>Response</h4>
             <Code>{`{

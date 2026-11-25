@@ -7,7 +7,8 @@ export type PaymentMethod = 'stripe' | 'lightning' | 'bitcoin';
 
 /** What credits can be bought with here, and on what terms. */
 export interface PaymentMethods {
-  data: { id: PaymentMethod }[];
+  /** `confirmations`, for bitcoin: how deep a payment must be to be credited. */
+  data: { id: PaymentMethod; confirmations?: number }[];
   minimum_amount: number;
   /** A fraction: 0.1 is 10%. */
   fee: number;
@@ -26,6 +27,24 @@ export interface Payment {
   created_at: number;
   completed_at?: number;
   expires_at: number;
+  /** A bitcoin payment's sats: what it asks for, and what's been sent so far, the mempool included. */
+  bitcoin?: { sats: number; received: number };
+}
+
+/** The balance, and credit on its way: bitcoin that's been sent but isn't confirmed yet. */
+export interface Credits {
+  amount: number;
+  pending: number;
+}
+
+/** Whether a bitcoin payment has been sent money that's waiting to confirm. */
+export function isConfirming(payment: Payment): boolean {
+  return payment.method === 'bitcoin' && payment.status !== 'completed' && (payment.bitcoin?.received ?? 0) > 0;
+}
+
+/** Whether a payment can still change: one that's open, or sent bitcoin that's still confirming. */
+export function isUnsettled(payment: Payment): boolean {
+  return payment.status === 'pending' || isConfirming(payment);
 }
 
 export interface Generation {
@@ -148,7 +167,7 @@ export class ApiClient {
     return (await response.json()) as T;
   }
 
-  balance(): Promise<{ amount: number }> {
+  balance(): Promise<Credits> {
     return this.request('GET', '/v1/credits');
   }
 

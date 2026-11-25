@@ -43,7 +43,11 @@ export function AddCreditsDialog({ open, onOpenChange, payment }: AddCreditsDial
         <DialogHeader>
           <DialogTitle>{shown ? `Pay with ${METHODS[shown.method].label}` : 'Add credits'}</DialogTitle>
           <DialogDescription>
-            {shown ? 'Credits are added as soon as the payment arrives.' : 'Credits pay for what you use, at the prices listed for each model.'}
+            {shown
+              ? shown.method === 'bitcoin'
+                ? 'Credits are added once the payment confirms.'
+                : 'Credits are added as soon as the payment arrives.'
+              : 'Credits pay for what you use, at the prices listed for each model.'}
           </DialogDescription>
         </DialogHeader>
         {shown ? <PaymentView payment={shown} /> : <AddCreditsForm onStarted={setStarted} />}
