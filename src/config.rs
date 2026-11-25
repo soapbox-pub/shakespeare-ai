@@ -118,7 +118,7 @@ pub struct Bitcoin {
     /// receive address.
     #[serde(deserialize_with = "wallet")]
     pub xpub: Wallet,
-    /// An Esplora API root. mempool.space's, for a mainnet key, unless given;
+    /// An Esplora API root. Ours, for a mainnet key, unless given;
     /// a testnet key must say which testnet.
     #[serde(default)]
     esplora: Option<url::Url>,
@@ -128,13 +128,17 @@ pub struct Bitcoin {
     pub confirmations: u32,
 }
 
+/// Our own Esplora, on our own node: what mainnet payments are checked
+/// against unless the config names another.
+pub const DEFAULT_ESPLORA: &str = "https://btc.soapbox.pub/api";
+
 fn default_confirmations() -> u32 {
     1
 }
 
 impl Bitcoin {
     pub fn esplora(&self) -> url::Url {
-        self.esplora.clone().unwrap_or_else(|| url::Url::parse("https://mempool.space/api").expect("a URL"))
+        self.esplora.clone().unwrap_or_else(|| url::Url::parse(DEFAULT_ESPLORA).expect("a URL"))
     }
 }
 
@@ -638,7 +642,7 @@ mod tests {
         let zpub = crate::payments::bitcoin::tests::ZPUB;
         let config = bitcoin(&format!("    xpub: {zpub}\n")).unwrap();
         let b = config.payments.bitcoin.unwrap();
-        assert_eq!((b.esplora().as_str(), b.confirmations), ("https://mempool.space/api", 1));
+        assert_eq!((b.esplora().as_str(), b.confirmations), ("https://btc.soapbox.pub/api", 1));
         // A testnet key must say which testnet.
         let mut tpub = ::bitcoin::base58::decode_check(zpub).unwrap();
         tpub[..4].copy_from_slice(&[0x04, 0x35, 0x87, 0xcf]);

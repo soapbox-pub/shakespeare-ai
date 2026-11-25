@@ -168,8 +168,10 @@ service holds no private key; the money lands in the wallet the key came
 from. Addresses are native segwit (`bc1q…`), and the payment's `url` is a
 BIP21 `bitcoin:` URI with the amount, for a QR code.
 
-Payments are confirmed by polling an Esplora API (mempool.space's unless
-`esplora` says otherwise; run your own for privacy) once a minute, and
+Payments are confirmed by polling an Esplora API once a minute: ours,
+`https://btc.soapbox.pub/api`, on our own node, unless `esplora` says
+otherwise. (Its answers decide what's credited, so point it only at a server
+you trust. Public ones such as mempool.space's rate-limit.) They're
 credited once the sats asked for are `confirmations` blocks deep (1 by
 default; 0 trusts the mempool, where a payment can still be double-spent).
 

@@ -4,7 +4,8 @@
 //! The service never holds a private key. Addresses are native segwit
 //! (P2WPKH, BIP84), on the account's receive chain (`…/0/i`), so the wallet
 //! the key came from sees the money arrive. Esplora is the API mempool.space
-//! and blockstream.info serve, and anyone can run their own.
+//! and blockstream.info serve; by default we ask our own, btc.soapbox.pub,
+//! whose answers we trust and which doesn't rate-limit us.
 
 use std::fmt;
 

@@ -39,8 +39,9 @@ payments:
     # payments leave unused addresses. (This one is BIP84's test vector, whose
     # seed is public: replace it.)
     xpub: zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs
-    # An Esplora API. mempool.space's by default; required for a testnet key.
-    # esplora: https://mempool.space/api
+    # An Esplora API. Ours, on our own node, by default; required for a
+    # testnet key, such as https://mempool.space/testnet4/api.
+    # esplora: https://btc.soapbox.pub/api
     # How many blocks deep a payment must be before it's credited.
     confirmations: 1
 
