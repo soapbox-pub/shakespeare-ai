@@ -30,6 +30,12 @@ use crate::store::{self, Generation};
 const HELD_OUTPUT_TOKENS: u32 = 4096;
 
 pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    super::detached(complete(app, method, uri, headers, body)).await
+}
+
+/// See [`super::detached`]: a completion the client hung up on is still
+/// charged.
+async fn complete(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let caller = app.authenticate_inference(&method, &uri, &headers, &body).await?;
     let raw = super::json_object(&body)?;
     if !raw.get("model").is_some_and(Value::is_string) {

@@ -10,6 +10,8 @@ pub mod models;
 pub mod schema;
 pub mod upstream;
 
+use std::future::Future;
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -73,6 +75,22 @@ impl From<anyhow::Error> for ApiError {
         crate::log::error("http.error", json!({ "error": format!("{error:#}") }));
         ApiError::internal()
     }
+}
+
+/// Run a handler's work in a task of its own, so it finishes even if the
+/// client hangs up.
+///
+/// Hyper drops a handler's future when its connection closes. For an
+/// inference request that would drop it between sending the request upstream
+/// and charging for the answer: the provider bills us for a completion that
+/// was never charged, as often as a client cares to hang up. Detached, the
+/// request runs to its charge whether or not anyone is left to hear the
+/// answer.
+pub async fn detached<T: Send + 'static>(work: impl Future<Output = Result<T, ApiError>> + Send + 'static) -> Result<T, ApiError> {
+    tokio::spawn(work).await.unwrap_or_else(|error| {
+        crate::log::error("http.panic", json!({ "error": error.to_string() }));
+        Err(ApiError::internal())
+    })
 }
 
 /// A request body that must be a JSON object.

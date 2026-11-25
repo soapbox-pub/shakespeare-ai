@@ -122,8 +122,19 @@ async fn fake_upstream() -> String {
         }))
         .into_response()
     }
+    /// Answers as the others do, but takes long enough to hang up on first.
+    async fn slow_chat(headers: axum::http::HeaderMap, body: Bytes) -> axum::response::Response {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        chat(headers, body).await
+    }
+    async fn slow_images(body: Bytes) -> axum::Json<Value> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        images(body).await
+    }
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/slow/v1/chat/completions", post(slow_chat))
+        .route("/slow/v1/images/generations", post(slow_images))
         .route("/anthropic/v1/messages", post(messages))
         .route("/v1/images/generations", post(images))
         .route("/down/v1/chat/completions", post(down))
@@ -164,6 +175,10 @@ providers:
     api: openai
     base_url: {root}/silent/v1
     api_key: test
+  slow:
+    api: openai
+    base_url: {root}/slow/v1
+    api_key: test
   claude:
     api: anthropic
     base_url: {root}/anthropic/v1
@@ -191,6 +206,20 @@ models:
     upstreams: [refuses/upstream-model, fake/upstream-model]
     context_window: 1000
     price: {{ input: 3, output: 15 }}
+  slow:
+    type: chat
+    hidden: true
+    upstreams: [slow/upstream-model]
+    context_window: 1000
+    price: {{ input: 3, output: 15 }}
+  slow-image:
+    type: image
+    hidden: true
+    upstreams: [slow/gpt-image-1]
+    price:
+      low: {{ square: 0.011, wide: 0.016 }}
+      medium: {{ square: 0.042, wide: 0.063 }}
+      high: {{ square: 0.167, wide: 0.25 }}
   claude:
     type: chat
     hidden: true
@@ -554,6 +583,29 @@ async fn charges_reported_usage_when_the_client_hangs_up() {
 
     assert_eq!(wait_for_generations(&app, 1).await, vec![(33_000_000, 0)]);
     assert_eq!(balance(&app), Money(1_000_000_000 - 33_000_000));
+    assert_eq!(holds(&app), 0);
+}
+
+#[tokio::test]
+async fn charges_a_whole_response_when_the_client_hangs_up_before_it() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    // Hung up on while the provider is still working: dropping the future is
+    // what hyper does when the connection closes.
+    let hang_up = |request| {
+        let app = app.clone();
+        async move { assert!(tokio::time::timeout(Duration::from_millis(50), router(app).oneshot(request)).await.is_err()) }
+    };
+    hang_up(chat("slow", false)).await;
+    hang_up(signed("POST", "/v1/images/generations", Some(json!({ "model": "slow-image", "prompt": "a cat" })))).await;
+
+    // Both are still seen through, and charged by what the provider said:
+    // 1000 × $3/M + 1000 × $15/M, and two medium squares.
+    let mut rows = wait_for_generations(&app, 2).await;
+    rows.sort();
+    assert_eq!(rows, [(18_000_000, 0), (84_000_000, 0)]);
+    assert_eq!(balance(&app), Money(1_000_000_000 - 18_000_000 - 84_000_000));
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(holds(&app), 0);
 }
 

@@ -20,6 +20,11 @@ const SIZES: &[&str] = &["1024x1024", "1024x1536", "1536x1024", "auto"];
 const FORMATS: &[&str] = &["png", "jpeg", "webp"];
 
 pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+    super::detached(generate(app, method, uri, headers, body)).await
+}
+
+/// See [`super::detached`]: an image the client hung up on is still charged.
+async fn generate(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
     let caller = app.authenticate_inference(&method, &uri, &headers, &body).await?;
     let pubkey = caller.pubkey.clone();
     let request = super::json_object(&body)?;
