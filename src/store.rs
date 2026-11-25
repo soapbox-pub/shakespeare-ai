@@ -123,6 +123,13 @@ pub struct BitcoinSats {
     pub sats: u64,
     /// What's been sent, the mempool included, at the last check.
     pub received: u64,
+    /// Credit its account may already spend, while what was sent confirms.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub advanced: Money,
+}
+
+fn is_zero(money: &Money) -> bool {
+    *money == Money::ZERO
 }
 
 pub struct NewPayment<'a> {
@@ -152,7 +159,7 @@ pub fn insert_payment(conn: &Connection, p: &NewPayment) -> Result<()> {
 
 /// A payment's columns, read by [`payment_row`] from [`PAYMENTS`].
 const PAYMENT_COLUMNS: &str =
-    "p.id, p.pubkey, p.method, p.status, p.amount, p.fee, p.url, p.provider_ref, p.created_at, p.completed_at, p.expires_at, b.sats, b.seen";
+    "p.id, p.pubkey, p.method, p.status, p.amount, p.fee, p.url, p.provider_ref, p.created_at, p.completed_at, p.expires_at, b.sats, b.seen, b.advanced";
 
 /// Payments, with a bitcoin payment's address. (No column names are shared.)
 const PAYMENTS: &str = "payments p LEFT JOIN bitcoin_addresses b ON b.payment_id = p.id";
@@ -180,7 +187,7 @@ fn payment_row(row: &rusqlite::Row) -> rusqlite::Result<Payment> {
         completed_at: row.get(9)?,
         expires_at: row.get(10)?,
         bitcoin: match row.get::<_, Option<i64>>(11)? {
-            Some(sats) => Some(BitcoinSats { sats: sats as u64, received: row.get::<_, i64>(12)? as u64 }),
+            Some(sats) => Some(BitcoinSats { sats: sats as u64, received: row.get::<_, i64>(12)? as u64, advanced: Money(row.get(13)?) }),
             None => None,
         },
     })
@@ -280,6 +287,8 @@ pub struct BitcoinWatch {
     pub seen: u64,
     pub checked_at: Option<i64>,
     pub checked_height: Option<u64>,
+    /// Credit advanced on it before it confirmed.
+    pub advanced: Money,
 }
 
 /// Bitcoin payments to look in on, with each address's state: those
@@ -305,8 +314,9 @@ fn watch_row(r: &rusqlite::Row) -> rusqlite::Result<(Payment, BitcoinWatch)> {
     let watch = BitcoinWatch {
         sats: r.get::<_, i64>(11)? as u64,
         seen: r.get::<_, i64>(12)? as u64,
-        checked_at: r.get(13)?,
-        checked_height: r.get::<_, Option<i64>>(14)?.map(|h| h as u64),
+        advanced: Money(r.get(13)?),
+        checked_at: r.get(14)?,
+        checked_height: r.get::<_, Option<i64>>(15)?.map(|h| h as u64),
     };
     Ok((payment_row(r)?, watch))
 }
@@ -322,7 +332,7 @@ pub fn record_bitcoin_check(conn: &Connection, payment_id: &str, seen: u64, now:
 
 /// Complete a bitcoin payment for what was actually paid: its credits and
 /// fee become `amount` and `fee`, and `paid` sats are recorded. Credits move
-/// once, as for any payment.
+/// once, as for any payment, and replace whatever was advanced on it.
 pub fn complete_bitcoin_payment(conn: &mut Connection, id: &str, now: i64, amount: Money, fee: Money, paid: u64) -> Result<bool> {
     let tx = write_tx(conn)?;
     let pubkey: Option<String> = tx
@@ -336,7 +346,7 @@ pub fn complete_bitcoin_payment(conn: &mut Connection, id: &str, now: i64, amoun
     let Some(pubkey) = pubkey else {
         return Ok(false);
     };
-    tx.execute("UPDATE bitcoin_addresses SET paid = ?2 WHERE payment_id = ?1", params![id, i64::try_from(paid)?])?;
+    tx.execute("UPDATE bitcoin_addresses SET paid = ?2, advanced = 0 WHERE payment_id = ?1", params![id, i64::try_from(paid)?])?;
     post(&tx, &pubkey, amount, Kind::Payment, id, now)?;
     tx.commit()?;
     Ok(true)
@@ -349,6 +359,114 @@ pub fn open_bitcoin_payments(conn: &Connection, pubkey: Option<&str>, now: i64) 
         params![now, pubkey],
         |r| r.get(0),
     )?)
+}
+
+// Advances: credit before confirmation.
+
+/// How much may be advanced (see `config::Trust`).
+#[derive(Clone, Copy, Debug)]
+pub struct AdvanceLimits {
+    pub max_advance: Money,
+    pub ratio: rust_decimal::Decimal,
+    pub max_total: Money,
+}
+
+/// What's advanced on bitcoin payments, one account's or everyone's, but
+/// for the payment `except`.
+fn advanced(conn: &Connection, pubkey: Option<&str>, except: &str) -> Result<Money> {
+    Ok(Money(conn.query_row(
+        "SELECT COALESCE(SUM(b.advanced), 0) FROM bitcoin_addresses b JOIN payments p ON p.id = b.payment_id
+         WHERE b.advanced > 0 AND b.payment_id != ?2 AND (?1 IS NULL OR p.pubkey = ?1)",
+        params![pubkey, except],
+        |r| r.get(0),
+    )?))
+}
+
+/// What an account may spend now on its payments that haven't confirmed.
+pub fn advances(conn: &Connection, pubkey: &str) -> Result<Money> {
+    advanced(conn, Some(pubkey), "")
+}
+
+/// Credit an account has bought that can't be taken back: completed bitcoin
+/// and Lightning payments. (A card payment can be charged back.)
+fn final_purchases(conn: &Connection, pubkey: &str) -> Result<Money> {
+    Ok(Money(conn.query_row(
+        "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE pubkey = ? AND status = 'completed' AND method IN ('bitcoin', 'lightning')",
+        [pubkey],
+        |r| r.get(0),
+    )?))
+}
+
+fn is_distrusted(conn: &Connection, pubkey: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT 1 FROM distrusted WHERE pubkey = ?", [pubkey], |_| Ok(())).optional()?.is_some())
+}
+
+/// The most an account may have advanced at once, on all its payments: a
+/// share of what it's paid for before, capped, or nothing for an account
+/// that's never paid, or whose advance once wasn't paid.
+pub fn advance_allowance(conn: &Connection, pubkey: &str, limits: &AdvanceLimits) -> Result<Money> {
+    if is_distrusted(conn, pubkey)? {
+        return Ok(Money::ZERO);
+    }
+    let share = Money::from_dollars(final_purchases(conn, pubkey)?.to_decimal() * limits.ratio).unwrap_or(Money::ZERO);
+    Ok(share.min(limits.max_advance).max(Money::ZERO))
+}
+
+/// Set what's advanced on a bitcoin payment that isn't yet credited to as
+/// much of `want` as its account's trust allows, first distrusting the
+/// account for good if `distrust`. What was advanced before, and now.
+///
+/// It's one write transaction, so payments checked at once can't each take
+/// the same room: each counts every other's advance, so an account's, and
+/// everyone's, never total more than the limits.
+pub fn set_bitcoin_advance(conn: &mut Connection, id: &str, want: Money, distrust: bool, limits: &AdvanceLimits, now: i64) -> Result<(Money, Money)> {
+    let tx = write_tx(conn)?;
+    let row: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT p.pubkey, p.status, b.advanced FROM payments p JOIN bitcoin_addresses b ON b.payment_id = p.id WHERE p.id = ?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((pubkey, status, before)) = row else {
+        return Ok((Money::ZERO, Money::ZERO));
+    };
+    let before = Money(before);
+    if status == "completed" {
+        return Ok((before, before));
+    }
+    if distrust {
+        tx.execute("INSERT INTO distrusted (pubkey, payment_id, created_at) VALUES (?, ?, ?) ON CONFLICT (pubkey) DO NOTHING", params![pubkey, id, now])?;
+    }
+    let mine = Money(advance_allowance(&tx, &pubkey, limits)?.nanos() - advanced(&tx, Some(&pubkey), id)?.nanos());
+    let everyone = Money(limits.max_total.nanos() - advanced(&tx, None, id)?.nanos());
+    let after = want.min(mine).min(everyone).max(Money::ZERO);
+    if after != before {
+        tx.execute("UPDATE bitcoin_addresses SET advanced = ? WHERE payment_id = ?", params![after.nanos(), id])?;
+    }
+    tx.commit()?;
+    Ok((before, after))
+}
+
+/// Take back every advance on a payment uncredited whose watch is up
+/// (`expires_at` at or before `before`), and distrust its account. The
+/// payments, and what each had advanced.
+pub fn lapse_bitcoin_advances(conn: &mut Connection, before: i64, now: i64) -> Result<Vec<(String, Money)>> {
+    let tx = write_tx(conn)?;
+    let lapsed: Vec<(String, String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT p.id, p.pubkey, b.advanced FROM bitcoin_addresses b JOIN payments p ON p.id = b.payment_id
+             WHERE b.advanced > 0 AND p.status != 'completed' AND p.expires_at <= ? ORDER BY p.id",
+        )?;
+        let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, pubkey, _) in &lapsed {
+        tx.execute("UPDATE bitcoin_addresses SET advanced = 0 WHERE payment_id = ?", [id])?;
+        tx.execute("INSERT INTO distrusted (pubkey, payment_id, created_at) VALUES (?, ?, ?) ON CONFLICT (pubkey) DO NOTHING", params![pubkey, id, now])?;
+    }
+    tx.commit()?;
+    Ok(lapsed.into_iter().map(|(id, _, advanced)| (id, Money(advanced))).collect())
 }
 
 /// Expire every pending Stripe payment past its time; Stripe's own session
@@ -583,11 +701,13 @@ pub fn record_generation(conn: &mut Connection, g: &Generation, hold: Option<&st
 
 // Holds.
 
-/// What an account can spend now: its balance, less what's held for its
-/// requests in flight.
+/// What an account can spend on inference now: its balance, plus what's
+/// advanced on its bitcoin payments that haven't confirmed, less what's held
+/// for its requests in flight. (Gift cards are bought from the balance
+/// alone, so an advance can't be moved to another account.)
 pub fn spendable(conn: &Connection, pubkey: &str) -> Result<Money> {
     let held: i64 = conn.query_row("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE pubkey = ?", [pubkey], |r| r.get(0))?;
-    Ok(Money(balance(conn, pubkey)?.nanos().saturating_sub(held)))
+    Ok(Money(balance(conn, pubkey)?.nanos().saturating_add(advances(conn, pubkey)?.nanos()).saturating_sub(held)))
 }
 
 /// Set `amount` aside for a request, if the account can spend that much and
@@ -1011,12 +1131,115 @@ mod tests {
             record_bitcoin_check(conn, "pi_1", 400, 7, 800_000)?;
             let watch = &bitcoin_to_watch(conn, None, 0, 50)?[0].1;
             assert_eq!((watch.seen, watch.checked_at, watch.checked_height), (400, Some(7), Some(800_000)));
-            assert_eq!(get_payment(conn, "pi_1")?.unwrap().bitcoin, Some(BitcoinSats { sats: 1000, received: 400 }));
+            assert_eq!(get_payment(conn, "pi_1")?.unwrap().bitcoin, Some(BitcoinSats { sats: 1000, received: 400, advanced: Money::ZERO }));
             assert_eq!(bitcoin_watch(conn, "pi_1")?.unwrap().1.seen, 400);
             assert!(bitcoin_to_watch(conn, Some("nobody"), 0, 50)?.is_empty());
             assert_eq!(open_bitcoin_payments(conn, None, 0)?, 1);
             assert_eq!(open_bitcoin_payments(conn, Some("nobody"), 0)?, 0);
             assert_eq!(open_bitcoin_payments(conn, None, 100)?, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn advances_only_what_trust_allows() {
+        let t = temp_db();
+        t.db.with(|conn| {
+            let bought = |conn: &mut Connection, id: &str, pubkey: &str, method: Method, dollars: i64| -> Result<()> {
+                let payment = NewPayment {
+                    id,
+                    pubkey,
+                    method,
+                    amount: DOLLAR.checked_mul(dollars).unwrap(),
+                    fee: Money::ZERO,
+                    url: "x",
+                    provider_ref: None,
+                    created_at: 1,
+                    expires_at: 100,
+                };
+                insert_payment(conn, &payment)?;
+                complete_payment(conn, id, 2)?;
+                Ok(())
+            };
+            let open = |conn: &mut Connection, id: &str, pubkey: &str| -> Result<()> {
+                let address = format!("bc1q{id}");
+                let payment = NewPayment {
+                    id,
+                    pubkey,
+                    method: Method::Bitcoin,
+                    amount: DOLLAR.checked_mul(10).unwrap(),
+                    fee: Money::ZERO,
+                    url: "bitcoin:x",
+                    provider_ref: Some(&address),
+                    created_at: 1,
+                    expires_at: 100,
+                };
+                insert_payment(conn, &payment)?;
+                insert_bitcoin_address(conn, id, "xpub1", take_bitcoin_index(conn, "xpub1")?, &address, 1000)?;
+                Ok(())
+            };
+            let limits = AdvanceLimits { max_advance: DOLLAR.checked_mul(50).unwrap(), ratio: rust_decimal::Decimal::new(5, 1), max_total: DOLLAR.checked_mul(20).unwrap() };
+            let ten = DOLLAR.checked_mul(10).unwrap();
+            let dollars = |n: i64| DOLLAR.checked_mul(n).unwrap();
+
+            // Never paid: nothing.
+            open(conn, "pi_a1", ALICE)?;
+            open(conn, "pi_a2", ALICE)?;
+            assert_eq!(set_bitcoin_advance(conn, "pi_a1", ten, false, &limits, 3)?, (Money::ZERO, Money::ZERO));
+            // A card payment can be charged back, so it doesn't count.
+            bought(conn, "pi_card", ALICE, Method::Stripe, 100)?;
+            assert_eq!(advance_allowance(conn, ALICE, &limits)?, Money::ZERO);
+            // Half of what's been paid by Lightning or bitcoin, across every
+            // open payment.
+            bought(conn, "pi_ln", ALICE, Method::Lightning, 30)?;
+            assert_eq!(advance_allowance(conn, ALICE, &limits)?, dollars(15));
+            assert_eq!(set_bitcoin_advance(conn, "pi_a1", ten, false, &limits, 3)?, (Money::ZERO, ten));
+            assert_eq!(set_bitcoin_advance(conn, "pi_a2", ten, false, &limits, 3)?, (Money::ZERO, dollars(5)));
+            assert_eq!(advances(conn, ALICE)?, dollars(15));
+            assert_eq!(spendable(conn, ALICE)?, dollars(145));
+            // Asking again for the same is no more.
+            assert_eq!(set_bitcoin_advance(conn, "pi_a1", ten, false, &limits, 3)?, (ten, ten));
+
+            // Never more than `max_total`, everyone's together.
+            bought(conn, "pi_bob", BOB, Method::Lightning, 1000)?;
+            assert_eq!(advance_allowance(conn, BOB, &limits)?, dollars(50));
+            open(conn, "pi_b1", BOB)?;
+            assert_eq!(set_bitcoin_advance(conn, "pi_b1", ten, false, &limits, 3)?, (Money::ZERO, dollars(5)));
+
+            // Credited: the advance gives way to the credit.
+            assert!(complete_bitcoin_payment(conn, "pi_a1", 4, ten, Money::ZERO, 1000)?);
+            assert_eq!(advances(conn, ALICE)?, dollars(5));
+            assert_eq!(get_payment(conn, "pi_a1")?.unwrap().bitcoin.unwrap().advanced, Money::ZERO);
+            assert_eq!(set_bitcoin_advance(conn, "pi_a1", ten, false, &limits, 5)?, (Money::ZERO, Money::ZERO));
+            assert_eq!(spendable(conn, ALICE)?, dollars(145));
+
+            // Taken back from a payment no longer watched, for good.
+            assert_eq!(lapse_bitcoin_advances(conn, 99, 6)?, []);
+            assert_eq!(lapse_bitcoin_advances(conn, 100, 6)?, [("pi_a2".to_string(), dollars(5)), ("pi_b1".to_string(), dollars(5))]);
+            assert_eq!(advances(conn, ALICE)?, Money::ZERO);
+            open(conn, "pi_a3", ALICE)?;
+            assert_eq!(set_bitcoin_advance(conn, "pi_a3", ten, false, &limits, 7)?, (Money::ZERO, Money::ZERO));
+            assert_eq!(advance_allowance(conn, BOB, &limits)?, Money::ZERO);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn distrusts_an_account_whose_advance_went_away() {
+        let t = temp_db();
+        t.db.with(|conn| {
+            pay(conn, "pi_ln", DOLLAR.checked_mul(100).unwrap());
+            complete_payment(conn, "pi_ln", 1)?;
+            let payment =
+                NewPayment { id: "pi_btc", pubkey: ALICE, method: Method::Bitcoin, amount: DOLLAR, fee: Money::ZERO, url: "x", provider_ref: Some("bc1q"), created_at: 1, expires_at: 100 };
+            insert_payment(conn, &payment)?;
+            insert_bitcoin_address(conn, "pi_btc", "xpub1", 0, "bc1q", 1000)?;
+            let limits = AdvanceLimits { max_advance: DOLLAR.checked_mul(50).unwrap(), ratio: rust_decimal::Decimal::ONE, max_total: DOLLAR.checked_mul(500).unwrap() };
+            assert_eq!(set_bitcoin_advance(conn, "pi_btc", DOLLAR, false, &limits, 2)?, (Money::ZERO, DOLLAR));
+            assert_eq!(set_bitcoin_advance(conn, "pi_btc", DOLLAR, true, &limits, 3)?, (DOLLAR, Money::ZERO));
+            assert_eq!(advance_allowance(conn, ALICE, &limits)?, Money::ZERO);
             Ok(())
         })
         .unwrap();

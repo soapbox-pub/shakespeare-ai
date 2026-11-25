@@ -666,7 +666,7 @@ async fn sells_and_redeems_gift_cards() {
     assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("giftcard_already_redeemed")));
 
     let (_, body) = json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits", None)).await.unwrap()).await;
-    assert_eq!(body, json!({ "object": "credits", "amount": 12.0, "pending": 0.0 }));
+    assert_eq!(body, json!({ "object": "credits", "amount": 12.0, "pending": 0.0, "advanced": 0.0 }));
 
     // A cancelled card is refunded, and listed as cancelled.
     let (_, body) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/giftcards", Some(json!({ "amount": 5 })))).await.unwrap()).await;
@@ -730,7 +730,7 @@ async fn sells_credits_for_onchain_bitcoin() {
     *esplora.tip.lock() = 800_000;
     let base = esplora.serve().await;
     let yaml = format!(
-        "origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  bitcoin:\n    xpub: {ZPUB}\n    esplora: {base}\n    confirmations: 2\nproviders: {{}}\nmodels: {{}}\n"
+        "origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  bitcoin:\n    xpub: {ZPUB}\n    esplora: {base}\n    confirmations: 2\n    trust: {{ max_advance: 0 }}\nproviders: {{}}\nmodels: {{}}\n"
     );
     let t = temp_db();
     let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
@@ -819,6 +819,93 @@ async fn sells_credits_for_onchain_bitcoin() {
     let listed = |id: &Value| data.iter().find(|p| &p["id"] == id).map(|p| (p["amount"].clone(), p["fee"].clone())).unwrap();
     assert_eq!(listed(&third["id"]), (json!(20.0), json!(2.0)));
     assert_eq!(listed(&second["id"]), (json!(5.0), json!(0.5)));
+}
+
+#[tokio::test]
+async fn advances_credit_to_accounts_that_have_paid_before() {
+    use crate::payments::bitcoin::tests::{FakeEsplora, FIRST, SECOND, ZPUB};
+    let esplora = FakeEsplora::default();
+    *esplora.tip.lock() = 800_000;
+    let base = esplora.serve().await;
+    let yaml = format!("origin: https://ai.example.com\ndatabase: unused.sqlite3\npayments:\n  bitcoin:\n    xpub: {ZPUB}\n    esplora: {base}\nproviders: {{}}\nmodels: {{}}\n");
+    let t = temp_db();
+    let app = Arc::new(App::new(Config::parse(&yaml).unwrap(), t.db.clone()).unwrap());
+    app.rates.set(rust_decimal::Decimal::from(100_000));
+    let pubkey = public_key(SECRET);
+    let dollars = |n: i64| Money(n * 1_000_000_000);
+    let add = || async {
+        let (status, payment) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "bitcoin" })))).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{payment}");
+        payment["id"].as_str().unwrap().to_string()
+    };
+    let payment = |id: &str| app.db.with(|conn| Ok(store::get_payment(conn, id)?.unwrap())).unwrap();
+    let advanced = |id: &str| payment(id).bitcoin.unwrap().advanced;
+    let spendable = || app.db.with(|conn| store::spendable(conn, &pubkey)).unwrap();
+    let credits = || async { json_of(router(app.clone()).oneshot(signed("GET", "/v1/credits", None)).await.unwrap()).await.1 };
+    let address = |i: u32| crate::payments::bitcoin::Wallet::parse(ZPUB).unwrap().address(i).unwrap();
+
+    // A new account waits for a confirmation, however well its payment pays.
+    let first = add().await;
+    esplora.pay_at(FIRST, 11_000, None, 20.0);
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!((advanced(&first), spendable()), (Money::ZERO, Money::ZERO));
+    let body = credits().await;
+    assert_eq!((body["pending"].as_f64(), body["advanced"].as_f64()), (Some(10.0), Some(0.0)));
+    esplora.txs.lock().clear();
+    esplora.pay(FIRST, 11_000, Some(800_001));
+    *esplora.tip.lock() = 800_001;
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(payment(&first).status, "completed");
+    assert_eq!(balance(&app), dollars(10));
+
+    // Having paid $10, it may spend $5 of its next payment at once, but only
+    // once that pays a fee that will confirm it soon.
+    let second = add().await;
+    esplora.pay_at(SECOND, 11_000, None, 1.0);
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(advanced(&second), Money::ZERO);
+    esplora.txs.lock().clear();
+    esplora.pay_at(SECOND, 11_000, None, 20.0);
+    crate::payments::check_bitcoin_now(&app, &second).await.unwrap();
+    assert_eq!(advanced(&second), dollars(5));
+    assert_eq!(spendable(), dollars(15));
+    let body = credits().await;
+    assert_eq!((body["amount"].as_f64(), body["pending"].as_f64(), body["advanced"].as_f64()), (Some(10.0), Some(10.0), Some(5.0)));
+    let (_, shown) = json_of(router(app.clone()).oneshot(signed("GET", &format!("/v1/credits/payments/{second}"), None)).await.unwrap()).await;
+    assert_eq!(shown["bitcoin"], json!({ "sats": 11_000, "received": 11_000, "advanced": 5.0 }));
+    // Confirmed, the credit takes the advance's place.
+    esplora.txs.lock().clear();
+    // (Checked every poll, now, not only once a block.)
+    esplora.pay(SECOND, 11_000, Some(800_002));
+    *esplora.tip.lock() = 800_002;
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(payment(&second).status, "completed");
+    assert_eq!((balance(&app), spendable()), (dollars(20), dollars(20)));
+
+    // Having paid $20, $10. Spent, then the payment is replaced: the advance
+    // is taken back, what was spent is owed, and the account is never
+    // advanced anything again.
+    let third = add().await;
+    esplora.pay_at(&address(2), 11_000, None, 20.0);
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(advanced(&third), dollars(10));
+    app.db
+        .with(|conn| {
+            let tx = store::write_tx(conn)?;
+            store::post(&tx, &pubkey, -dollars(25), store::Kind::Generation, "gen_spent", 0)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(spendable(), dollars(5));
+    esplora.txs.lock().remove(&address(2));
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(advanced(&third), Money::ZERO);
+    assert_eq!((balance(&app), spendable()), (dollars(-5), dollars(-5)));
+    let fourth = add().await;
+    esplora.pay_at(&address(3), 11_000, None, 20.0);
+    crate::payments::check_bitcoin_payments(&app).await.unwrap();
+    assert_eq!(advanced(&fourth), Money::ZERO);
 }
 
 #[tokio::test]

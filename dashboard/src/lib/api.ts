@@ -27,14 +27,21 @@ export interface Payment {
   created_at: number;
   completed_at?: number;
   expires_at: number;
-  /** A bitcoin payment's sats: what it asks for, and what's been sent so far, the mempool included. */
-  bitcoin?: { sats: number; received: number };
+  /**
+   * A bitcoin payment's sats: what it asks for, and what's been sent so far, the mempool included; and, for an
+   * account that's paid before, the credit it can already spend while that confirms.
+   */
+  bitcoin?: { sats: number; received: number; advanced?: number };
 }
 
-/** The balance, and credit on its way: bitcoin that's been sent but isn't confirmed yet. */
+/**
+ * The balance, and credit on its way: bitcoin that's been sent but isn't confirmed yet, of which `advanced` can
+ * be spent already.
+ */
 export interface Credits {
   amount: number;
   pending: number;
+  advanced?: number;
 }
 
 /** Whether a bitcoin payment has been sent money that's waiting to confirm. */

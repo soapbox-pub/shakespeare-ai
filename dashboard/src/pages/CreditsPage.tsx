@@ -77,6 +77,12 @@ function Credits() {
               <span>
                 <span className="font-medium text-foreground tabular-nums">+{usd(balance.data.pending)}</span> pending, added
                 once your bitcoin confirms
+                {balance.data.advanced ? (
+                  <>
+                    . You can spend <span className="font-medium text-foreground tabular-nums">{usd(balance.data.advanced)}</span>{' '}
+                    of it already.
+                  </>
+                ) : null}
               </span>
             </p>
           ) : null}

@@ -72,6 +72,7 @@ function Details({ payment, onResume }: { payment: Payment; onResume: (payment: 
             <>
               <Row label="Sats asked for">{sats.sats.toLocaleString()}</Row>
               <Row label="Sats received">{sats.received.toLocaleString()}</Row>
+              {sats.advanced ? <Row label="Spendable before confirming">{usd(sats.advanced)}</Row> : null}
             </>
           )}
           {payment.description && <Row label="Description">{payment.description}</Row>}

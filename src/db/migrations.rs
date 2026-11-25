@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP), ("008_bitcoin_advances", BITCOIN_ADVANCES)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -228,4 +228,25 @@ CREATE TABLE bitcoin_accounts (
 INSERT INTO bitcoin_accounts (xpub, next_idx) SELECT xpub, MAX(idx) + 1 FROM bitcoin_addresses GROUP BY xpub;
 
 CREATE INDEX payments_expired ON payments (expires_at) WHERE status = 'expired';
+"#;
+
+/// Credit given before a bitcoin payment confirms, to accounts that have
+/// paid before, and the accounts that lost that trust.
+const BITCOIN_ADVANCES: &str = r#"
+-- Credit its account may spend now, on sats sent that haven't confirmed. Not
+-- money moved: the ledger and balances don't see it until the payment is
+-- credited, which sets it back to 0. If the payment never confirms, it's
+-- taken back, and whatever was spent of it is left owed, a negative balance.
+ALTER TABLE bitcoin_addresses ADD COLUMN advanced INTEGER NOT NULL DEFAULT 0 CHECK (advanced >= 0);
+
+CREATE INDEX bitcoin_advances ON bitcoin_addresses (payment_id) WHERE advanced > 0;
+
+-- Accounts whose advanced payment never confirmed, and are never advanced
+-- anything again.
+CREATE TABLE distrusted (
+    pubkey TEXT PRIMARY KEY,
+    -- The payment that wasn't paid. It may since have been deleted.
+    payment_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
 "#;

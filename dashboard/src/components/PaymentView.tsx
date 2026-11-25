@@ -103,6 +103,12 @@ function Confirming({ payment, sats }: { payment: Payment; sats: NonNullable<Pay
         {confirmations === 1 ? 'a confirmation' : `${confirmations} confirmations`}, usually within an hour, or longer if
         the fee was low. You can close this; it's added on its own.
       </p>
+      {sats.advanced ? (
+        <p className="text-sm text-muted-foreground">
+          Since you've paid before, you can spend{' '}
+          <span className="font-medium text-foreground">{usd(sats.advanced)}</span> of it now.
+        </p>
+      ) : null}
       {short && (
         <p className="text-sm text-muted-foreground">
           {sats.received.toLocaleString()} of the {sats.sats.toLocaleString()} sats asked for arrived, so it's credited for

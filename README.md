@@ -205,6 +205,28 @@ mempool, where a payment can still be double-spent).
 - What's been sent shows before it's credited: a payment's `bitcoin` has the
   `sats` it asks for and the sats `received`, the mempool included, and the
   balance's `pending` is what's on its way, valued as it will be credited.
+- **Accounts that have paid before needn't wait.** What's been sent to a
+  payment and will very likely confirm (in a block, or in the mempool paying
+  at least Esplora's fee estimate for 6 blocks) is advanced: its account may
+  spend it at once, as its payment's `bitcoin.advanced` and the balance's
+  `advanced`. An account's advances, on all its open payments together, are
+  at most `trust.ratio` (0.5) of the credit it has ever bought by bitcoin or
+  Lightning (not card, which can be charged back), and never more than
+  `trust.max_advance` ($50); everyone's together, never more than
+  `trust.max_total` ($500). Each is set in one write transaction counting
+  every other, so payments checked at once can't overshoot. A new account
+  always waits for its confirmation, and new pubkeys earn nothing.
+- An advance isn't a ledger entry: like a hold, it only changes what can be
+  spent on inference (gift cards are bought from the balance alone, so it
+  can't be moved to another account). When the payment is credited, the
+  credit takes its place. An address with an advance is checked every
+  minute; if what was sent to it shrinks (a transaction replaced or dropped),
+  or it's still unconfirmed when its week of watching is up, the advance is
+  taken back, what was spent of it is left owed as a negative balance, and
+  the account is in `distrusted` and never advanced anything again
+  (`payments.bitcoin.advance_failed`). So the most anyone can take is half of
+  what they've already paid, up to $50, once per account. `max_advance: 0`
+  turns advances off.
 - An account may have 3 bitcoin payments open at once, and everyone
   together `max_pending` (200 by default); past that, a new one is refused
   with a 503 until some are paid or expire. That bounds how fast addresses
@@ -284,6 +306,9 @@ SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
   the sum of its generations' costs, so there's no counter to drift.
 - `holds` is the credit set aside for requests in flight. Holds aren't
   ledger entries: they move no money, they only limit what can be spent.
+  Nor are advances, `bitcoin_addresses.advanced`: credit spendable before a
+  payment confirms. `distrusted` lists accounts that are never advanced
+  anything again.
 
 Anything that releases money (a payment completing, a gift card being
 redeemed or cancelled) is one conditional `UPDATE … RETURNING`, and credit

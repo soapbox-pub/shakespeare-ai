@@ -91,6 +91,12 @@ pub fn uri(address: &str, sats: u64) -> String {
 struct Tx {
     status: TxStatus,
     vout: Vec<TxOut>,
+    /// Sats, and weight units. Missing, a transaction counts as paying no
+    /// fee, which only means nothing is advanced on it.
+    #[serde(default)]
+    fee: u64,
+    #[serde(default)]
+    weight: u64,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +118,35 @@ pub struct Received {
     pub seen: u64,
     /// In blocks at least the required depth.
     pub confirmed: u64,
+    /// In blocks, however deep.
+    pub mined: u64,
+    /// Each transaction still in the mempool.
+    pub mempool: Vec<Unconfirmed>,
+}
+
+/// A transaction in the mempool: what it sends the address, and the fee
+/// it pays for its weight.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Unconfirmed {
+    pub sats: u64,
+    pub fee: u64,
+    pub weight: u64,
+}
+
+impl Unconfirmed {
+    /// Whether it pays at least `rate` sats a vbyte (four weight units).
+    pub fn pays(&self, rate: f64) -> bool {
+        self.weight > 0 && self.fee as f64 * 4.0 >= rate * self.weight as f64
+    }
+}
+
+impl Received {
+    /// What's in a block, or in the mempool at `rate` or better: what will
+    /// very likely confirm soon. Without a rate, only what's in a block.
+    pub fn likely(&self, rate: Option<f64>) -> u64 {
+        let mempool: u64 = rate.map_or(0, |rate| self.mempool.iter().filter(|tx| tx.pays(rate)).map(|tx| tx.sats).sum());
+        self.mined + mempool
+    }
 }
 
 fn endpoint(esplora: &url::Url, path: &str) -> String {
@@ -138,12 +173,33 @@ pub async fn received(http: &reqwest::Client, esplora: &url::Url, address: &str,
             (true, Some(height)) => tip.saturating_sub(height) + 1,
             _ => 0,
         };
+        if value == 0 {
+            continue;
+        }
         received.seen += value;
         if depth >= u64::from(confirmations) {
             received.confirmed += value;
         }
+        if depth > 0 {
+            received.mined += value;
+        } else {
+            received.mempool.push(Unconfirmed { sats: value, fee: tx.fee, weight: tx.weight });
+        }
     }
     Ok(received)
+}
+
+/// The blocks a transaction we advance credit on should confirm within, by
+/// its fee: one paying less could sit in the mempool until it's dropped,
+/// and be double-spent then.
+const FEE_TARGET: &str = "6";
+
+/// The fee rate, in sats a vbyte, Esplora expects to confirm a transaction
+/// within [`FEE_TARGET`] blocks.
+pub async fn fee_rate(http: &reqwest::Client, esplora: &url::Url) -> Result<f64> {
+    let estimates: std::collections::HashMap<String, f64> =
+        http.get(endpoint(esplora, "fee-estimates")).timeout(super::TIMEOUT).send().await?.error_for_status()?.json().await?;
+    estimates.get(FEE_TARGET).copied().filter(|rate| rate.is_finite() && *rate > 0.0).ok_or(anyhow!("Esplora has no fee estimate for {FEE_TARGET} blocks"))
 }
 
 #[cfg(test)]
@@ -192,17 +248,25 @@ pub mod tests {
         assert_eq!(uri(FIRST, 100_000_000), format!("bitcoin:{FIRST}?amount=1&label=Shakespeare%20AI%20Credits"));
     }
 
-    /// A fake Esplora: a tip height, and transactions by address.
+    /// A fake Esplora: a tip height, transactions by address, and the fee
+    /// rate to confirm within 6 blocks (10 sats/vB unless set).
     #[derive(Clone, Default)]
     pub struct FakeEsplora {
         pub tip: Arc<Mutex<u64>>,
         pub txs: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+        pub fee_rate: Arc<Mutex<Option<f64>>>,
     }
 
     impl FakeEsplora {
         /// Pay `sats` to `address`, in the block at `height` or, if none, the
-        /// mempool.
+        /// mempool, with a transaction paying no fee.
         pub fn pay(&self, address: &str, sats: u64, height: Option<u64>) {
+            self.pay_at(address, sats, height, 0.0);
+        }
+
+        /// [`FakeEsplora::pay`], paying `rate` sats a vbyte.
+        pub fn pay_at(&self, address: &str, sats: u64, height: Option<u64>, rate: f64) {
+            let weight = 561;
             let tx = json!({
                 "txid": "00",
                 "status": { "confirmed": height.is_some(), "block_height": height },
@@ -210,6 +274,8 @@ pub mod tests {
                     { "scriptpubkey_address": address, "value": sats },
                     { "scriptpubkey_address": "bc1qchange", "value": 99_999 },
                 ],
+                "fee": (rate * weight as f64 / 4.0).ceil() as u64,
+                "weight": weight,
             });
             self.txs.lock().entry(address.to_string()).or_default().push(tx);
         }
@@ -219,7 +285,15 @@ pub mod tests {
             let txs = |State(fake): State<FakeEsplora>, Path(address): Path<String>| async move {
                 Json(Value::Array(fake.txs.lock().get(&address).cloned().unwrap_or_default()))
             };
-            let app = axum::Router::new().route("/api/blocks/tip/height", get(tip)).route("/api/address/{address}/txs", get(txs)).with_state(self.clone());
+            let fees = |State(fake): State<FakeEsplora>| async move {
+                let rate = fake.fee_rate.lock().unwrap_or(10.0);
+                Json(json!({ "1": rate * 2.0, "6": rate, "144": rate / 2.0 }))
+            };
+            let app = axum::Router::new()
+                .route("/api/blocks/tip/height", get(tip))
+                .route("/api/address/{address}/txs", get(txs))
+                .route("/api/fee-estimates", get(fees))
+                .with_state(self.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}/api/", listener.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -236,12 +310,24 @@ pub mod tests {
         assert_eq!(tip_height(&http, &esplora).await.unwrap(), 100);
         assert_eq!(received(&http, &esplora, FIRST, 100, 1).await.unwrap(), Received::default());
 
-        fake.pay(FIRST, 1000, None);
+        fake.pay_at(FIRST, 1000, None, 4.0);
         fake.pay(FIRST, 2000, Some(100));
         fake.pay(FIRST, 4000, Some(98));
-        assert_eq!(received(&http, &esplora, FIRST, 100, 0).await.unwrap(), Received { seen: 7000, confirmed: 7000 });
-        assert_eq!(received(&http, &esplora, FIRST, 100, 1).await.unwrap(), Received { seen: 7000, confirmed: 6000 });
-        assert_eq!(received(&http, &esplora, FIRST, 100, 3).await.unwrap(), Received { seen: 7000, confirmed: 4000 });
+        let mempool = || vec![Unconfirmed { sats: 1000, fee: 561, weight: 561 }];
+        assert_eq!(received(&http, &esplora, FIRST, 100, 0).await.unwrap(), Received { seen: 7000, confirmed: 7000, mined: 6000, mempool: mempool() });
+        assert_eq!(received(&http, &esplora, FIRST, 100, 1).await.unwrap(), Received { seen: 7000, confirmed: 6000, mined: 6000, mempool: mempool() });
+        let deep = received(&http, &esplora, FIRST, 100, 3).await.unwrap();
+        assert_eq!((deep.seen, deep.confirmed), (7000, 4000));
         assert_eq!(received(&http, &esplora, SECOND, 100, 1).await.unwrap(), Received::default());
+
+        // What will likely confirm: what's mined, and what pays enough.
+        assert_eq!(deep.likely(None), 6000);
+        assert_eq!(deep.likely(Some(4.0)), 7000);
+        assert_eq!(deep.likely(Some(4.1)), 6000);
+        assert!(!Unconfirmed { sats: 1, fee: 100, weight: 0 }.pays(1.0));
+
+        assert_eq!(fee_rate(&http, &esplora).await.unwrap(), 10.0);
+        *fake.fee_rate.lock() = Some(2.5);
+        assert_eq!(fee_rate(&http, &esplora).await.unwrap(), 2.5);
     }
 }

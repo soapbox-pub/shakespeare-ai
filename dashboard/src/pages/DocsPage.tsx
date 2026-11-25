@@ -189,13 +189,16 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
             <Endpoint method="GET" path="/v1/credits" />
             <p>
               Retrieves the user's current credit balance. <code>pending</code> is credit on its way: bitcoin that's been
-              sent, the mempool included, but isn't yet confirmed deep enough to spend.
+              sent, the mempool included, but isn't yet confirmed deep enough to credit. <code>advanced</code> is the part of
+              it that can be spent already (see below); spending it can take <code>amount</code> below zero until the
+              payment confirms.
             </p>
             <h4>Response</h4>
             <Code>{`{
   "object": "credits",
   "amount": 10.50,
-  "pending": 0
+  "pending": 0,
+  "advanced": 0
 }`}</Code>
 
             <h3>List Payment Methods</h3>
@@ -245,6 +248,14 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
               payment expires (a top-up before then still counts). An account may have 3 bitcoin payments open at once.
               A Bitcoin payment also has <code>bitcoin</code>: the <code>sats</code> it asks for, and the sats{' '}
               <code>received</code> so far, the mempool included, so a client can show it's been paid while it confirms.
+            </p>
+            <p>
+              An account that has paid by Bitcoin or Lightning before needn't wait: once its transaction is in a block, or in
+              the mempool paying a fee that should confirm it within a few blocks, up to half of what it has ever paid this
+              way can be spent before it confirms, and at most $50 at once across its payments. That's the payment's{' '}
+              <code>bitcoin.advanced</code>. A new account always waits for the confirmation. If an advanced payment's
+              transaction is replaced or dropped, or never confirms, the advance is taken back, whatever was spent of it is
+              owed, and the account isn't advanced anything again.
             </p>
             <h4>Response</h4>
             <Code>{`{

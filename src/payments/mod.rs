@@ -165,6 +165,9 @@ pub async fn check_lightning(app: &App, payment: &Payment) -> Result<()> {
 ///
 /// Something unconfirmed keeps a payment pending past its time, for up to
 /// [`BITCOIN_GRACE`]; after that, what's confirmed is what's credited.
+///
+/// Until it's credited, an account that's paid before may spend some of
+/// what's on its way at once (see [`advance_bitcoin`]).
 async fn check_bitcoin(app: &App, config: &crate::config::Bitcoin, payment: &Payment, watch: &store::BitcoinWatch, tip: u64) -> Result<()> {
     let Some(address) = &payment.provider_ref else { return Ok(()) };
     let received = bitcoin::received(&app.http, &config.esplora(), address, tip, config.confirmations).await?;
@@ -175,7 +178,8 @@ async fn check_bitcoin(app: &App, config: &crate::config::Bitcoin, payment: &Pay
 
     let owed = watch.sats;
     let past_due = now > payment.expires_at;
-    let settled = received.seen == received.confirmed || now > payment.expires_at + BITCOIN_GRACE;
+    let past_grace = now > payment.expires_at + BITCOIN_GRACE;
+    let settled = received.seen == received.confirmed || past_grace;
     if received.confirmed > 0 && (received.confirmed >= owed || (past_due && settled)) {
         let (amount, fee) = (pro_rata(payment.amount, received.confirmed, owed)?, pro_rata(payment.fee, received.confirmed, owed)?);
         let (id, paid) = (payment.id.clone(), received.confirmed);
@@ -186,7 +190,7 @@ async fn check_bitcoin(app: &App, config: &crate::config::Bitcoin, payment: &Pay
         if app.db.call(move |conn| store::complete_bitcoin_payment(conn, &id, now, amount, fee, paid)).await? {
             let log = serde_json::json!({
                 "id": payment.id, "method": "bitcoin", "address": address, "sats": owed, "paid": paid,
-                "credits": amount.to_f64(), "asked": payment.amount.to_f64(),
+                "credits": amount.to_f64(), "asked": payment.amount.to_f64(), "advanced": watch.advanced.to_f64(),
             });
             crate::log::info("payments.completed", log.clone());
             if paid != owed {
@@ -195,9 +199,73 @@ async fn check_bitcoin(app: &App, config: &crate::config::Bitcoin, payment: &Pay
         }
         return Ok(());
     }
-    if payment.status == "pending" && past_due && (received.seen == 0 || now > payment.expires_at + BITCOIN_GRACE) {
+    if payment.status == "pending" && past_due && (received.seen == 0 || past_grace) {
         let id = payment.id.clone();
         app.db.call(move |conn| store::expire_payment(conn, &id)).await?;
+    }
+    advance_bitcoin(app, config, payment, watch, &received, past_grace).await
+}
+
+/// Advance credit on what's been sent to a bitcoin payment and will very
+/// likely confirm: what's in a block, or in the mempool paying a fee to
+/// confirm within a few blocks. How much is capped by the account's trust,
+/// so an account that's never paid before gets nothing, and waits.
+///
+/// An advance never shrinks for want of fee: fee rates rise and fall. It's
+/// taken back if what was sent goes away (a transaction replaced or dropped), or
+/// if the payment's watched for [`BITCOIN_GRACE`] without confirming; then
+/// the account is never advanced anything again, and owes whatever it spent.
+async fn advance_bitcoin(
+    app: &App,
+    config: &crate::config::Bitcoin,
+    payment: &Payment,
+    watch: &store::BitcoinWatch,
+    received: &bitcoin::Received,
+    past_grace: bool,
+) -> Result<()> {
+    let trust = &config.trust;
+    if !trust.enabled() && !watch.advanced.is_positive() {
+        return Ok(());
+    }
+    let limits = trust.limits();
+    let gone = received.seen < watch.seen;
+    let distrust = watch.advanced.is_positive() && (gone || past_grace);
+    let owed = watch.sats;
+
+    let want = if past_grace || !trust.enabled() || received.seen == 0 {
+        Money::ZERO
+    } else {
+        let pubkey = payment.pubkey.clone();
+        let allowance = app.db.call(move |conn| store::advance_allowance(conn, &pubkey, &limits)).await?;
+        // Ask about fees only if there's something they could change.
+        let rate = if allowance.is_positive() && !received.mempool.is_empty() {
+            match bitcoin::fee_rate(&app.http, &config.esplora()).await {
+                Ok(rate) => Some(rate),
+                Err(error) => {
+                    crate::log::warn("payments.bitcoin", serde_json::json!({ "id": payment.id, "error": format!("{error:#}") }));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let fresh = if allowance.is_positive() { pro_rata(payment.amount, received.likely(rate).min(owed), owed)? } else { Money::ZERO };
+        let kept = if gone { Money::ZERO } else { watch.advanced.min(pro_rata(payment.amount, received.seen.min(owed), owed)?) };
+        fresh.max(kept)
+    };
+    if want == watch.advanced && !distrust {
+        return Ok(());
+    }
+    let id = payment.id.clone();
+    let now = crate::util::now();
+    let (before, after) = app.db.call(move |conn| store::set_bitcoin_advance(conn, &id, want, distrust, &limits, now)).await?;
+    if distrust {
+        crate::log::warn(
+            "payments.bitcoin.advance_failed",
+            serde_json::json!({ "id": payment.id, "advanced": before.to_f64(), "seen": received.seen, "was": watch.seen, "past_grace": past_grace }),
+        );
+    } else if after != before {
+        crate::log::info("payments.bitcoin.advanced", serde_json::json!({ "id": payment.id, "credits": after.to_f64(), "was": before.to_f64(), "seen": received.seen }));
     }
     Ok(())
 }
@@ -212,6 +280,8 @@ fn pro_rata(money: Money, paid: u64, owed: u64) -> Result<Money> {
 /// could have changed, so addresses no one pays cost next to nothing.
 ///
 /// - Never checked: yes.
+/// - Advanced credit: every poll, so a transaction replaced or dropped is
+///   noticed within a minute, and the advance taken back.
 /// - Sent something that isn't yet deep enough: only once there's a new
 ///   block, which is all that can change that. (With no confirmations
 ///   needed, the mempool counts, so it's checked as an open payment is.)
@@ -221,6 +291,9 @@ fn pro_rata(money: Money, paid: u64, owed: u64) -> Result<Money> {
 ///   every 6 hours until [`BITCOIN_GRACE`] is up.
 fn bitcoin_check_due(payment: &Payment, watch: &store::BitcoinWatch, now: i64, tip: u64, confirmations: u32) -> bool {
     let Some(checked_at) = watch.checked_at else { return true };
+    if watch.advanced.is_positive() {
+        return true;
+    }
     if watch.seen > 0 && confirmations > 0 {
         return watch.checked_height != Some(tip);
     }
@@ -288,6 +361,15 @@ pub async fn pending_credits(app: &App, pubkey: &str) -> Result<Money> {
     Ok(total)
 }
 
+/// Take back what's advanced on payments past their [`BITCOIN_GRACE`],
+/// uncredited, including those no longer watched, which no check would.
+fn lapse_bitcoin_advances(conn: &mut rusqlite::Connection, now: i64) -> Result<()> {
+    for (id, advanced) in store::lapse_bitcoin_advances(conn, now - BITCOIN_GRACE, now)? {
+        crate::log::warn("payments.bitcoin.advance_failed", serde_json::json!({ "id": id, "advanced": advanced.to_f64(), "past_grace": true }));
+    }
+    Ok(())
+}
+
 /// Look in on pending payments once a minute.
 pub async fn poll(app: Arc<App>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -300,6 +382,7 @@ pub async fn poll(app: Arc<App>) {
             if deleted > 0 {
                 crate::log::info("payments.deleted", serde_json::json!({ "count": deleted }));
             }
+            lapse_bitcoin_advances(conn, now)?;
             store::pending_lightning(conn)
         });
         let pending = match pending.await {
@@ -401,7 +484,7 @@ mod tests {
             provider_ref: None,
             bitcoin: None,
         };
-        let checked = |at: i64, seen: u64| store::BitcoinWatch { sats: 100, seen, checked_at: Some(at), checked_height: Some(10) };
+        let checked = |at: i64, seen: u64| store::BitcoinWatch { sats: 100, seen, checked_at: Some(at), checked_height: Some(10), advanced: Money::ZERO };
         let (open, expired) = (payment("pending"), payment("expired"));
 
         assert!(bitcoin_check_due(&open, &store::BitcoinWatch::default(), 500, 10, 1));
@@ -411,6 +494,8 @@ mod tests {
         assert!(!bitcoin_check_due(&open, &checked(499, 50), 500, 10, 1));
         assert!(bitcoin_check_due(&open, &checked(499, 50), 500, 11, 1));
         assert!(bitcoin_check_due(&open, &checked(499, 50), 500, 10, 0));
+        // Advanced credit: every poll, to notice it being taken back.
+        assert!(bitcoin_check_due(&open, &store::BitcoinWatch { advanced: Money(1), ..checked(499, 50) }, 500, 10, 1));
         // Past its time and unpaid: less and less often.
         assert!(!bitcoin_check_due(&expired, &checked(1100, 0), 1200, 10, 1));
         assert!(bitcoin_check_due(&expired, &checked(1100, 0), 1400, 10, 1));

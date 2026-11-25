@@ -17,9 +17,10 @@ use crate::store::{self, Method as PaymentMethod};
 pub async fn balance(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let pubkey = app.authenticate(&method, &uri, &headers, b"")?;
     let who = pubkey.clone();
-    let amount = app.db.call(move |conn| store::balance(conn, &who)).await?;
+    let (amount, advanced) = app.db.call(move |conn| Ok((store::balance(conn, &who)?, store::advances(conn, &who)?))).await?;
     let pending = crate::payments::pending_credits(&app, &pubkey).await?;
-    Ok(Json(json!({ "object": "credits", "amount": amount.to_f64(), "pending": pending.to_f64() })))
+    // `advanced` is the part of `pending` that can be spent already.
+    Ok(Json(json!({ "object": "credits", "amount": amount.to_f64(), "pending": pending.to_f64(), "advanced": advanced.to_f64() })))
 }
 
 /// What a client can buy credits with, and on what terms. Public: it's the

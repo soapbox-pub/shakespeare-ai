@@ -48,6 +48,14 @@ payments:
     # takes an address, so at most this many are used up a day. (An account
     # may have 3.)
     max_pending: 200
+    # Credit spendable before confirmation, for accounts that have paid by
+    # bitcoin or Lightning before: at most `ratio` of what they've paid, and
+    # `max_advance` dollars, at once; everyone's together, at most
+    # `max_total`. New accounts always wait. `max_advance: 0` turns it off.
+    trust:
+      max_advance: 50
+      ratio: 0.5
+      max_total: 500
 
 # How hard to try a model's upstreams. A request falls over to the next one
 # when an upstream can't be reached, is overloaded or down (408, 429, 5xx),

@@ -132,10 +132,62 @@ pub struct Bitcoin {
     /// wallet's gap limit): at most this many a day.
     #[serde(default = "default_max_pending")]
     pub max_pending: u32,
+    /// How much credit accounts that have paid before get while their
+    /// payment confirms.
+    #[serde(default)]
+    pub trust: Trust,
 }
 
 fn default_max_pending() -> u32 {
     200
+}
+
+/// Credit before confirmation, for accounts that have paid before. An
+/// account's advances, on all its open payments together, are at most
+/// `ratio` of the credit it has ever bought by bitcoin or Lightning, and
+/// never more than `max_advance`; everyone's together, never more than
+/// `max_total`. An account whose advanced payment never confirms is never
+/// advanced anything again.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Trust {
+    /// Dollars. Zero turns advances off.
+    #[serde(default = "default_max_advance", deserialize_with = "deserialize_decimal")]
+    pub max_advance: Decimal,
+    #[serde(default = "default_trust_ratio", deserialize_with = "deserialize_decimal")]
+    pub ratio: Decimal,
+    /// Dollars.
+    #[serde(default = "default_max_total_advance", deserialize_with = "deserialize_decimal")]
+    pub max_total: Decimal,
+}
+
+impl Default for Trust {
+    fn default() -> Self {
+        Trust { max_advance: default_max_advance(), ratio: default_trust_ratio(), max_total: default_max_total_advance() }
+    }
+}
+
+fn default_max_advance() -> Decimal {
+    Decimal::from(50)
+}
+
+fn default_trust_ratio() -> Decimal {
+    Decimal::new(5, 1)
+}
+
+fn default_max_total_advance() -> Decimal {
+    Decimal::from(500)
+}
+
+impl Trust {
+    pub fn enabled(&self) -> bool {
+        self.limits().max_advance.is_positive() && self.ratio > Decimal::ZERO && self.limits().max_total.is_positive()
+    }
+
+    pub fn limits(&self) -> crate::store::AdvanceLimits {
+        let money = |d: Decimal| Money::from_dollars(d).unwrap_or(Money::ZERO);
+        crate::store::AdvanceLimits { max_advance: money(self.max_advance), ratio: self.ratio, max_total: money(self.max_total) }
+    }
 }
 
 /// Our own Esplora, on our own node: what mainnet payments are checked
@@ -693,6 +745,12 @@ mod tests {
         let config = bitcoin(&format!("    xpub: {zpub}\n")).unwrap();
         let b = config.payments.bitcoin.unwrap();
         assert_eq!((b.esplora().as_str(), b.confirmations), ("https://btc.soapbox.pub/api", 1));
+        let limits = b.trust.limits();
+        assert!(b.trust.enabled());
+        assert_eq!((limits.max_advance, limits.ratio, limits.max_total), (Money(50_000_000_000), Decimal::new(5, 1), Money(500_000_000_000)));
+        let off = bitcoin(&format!("    xpub: {zpub}\n    trust: {{ max_advance: 0 }}\n")).unwrap();
+        assert!(!off.payments.bitcoin.unwrap().trust.enabled());
+        assert!(bitcoin(&format!("    xpub: {zpub}\n    trust: {{ limit: 5 }}\n")).is_err());
         // A testnet key must say which testnet.
         let mut tpub = ::bitcoin::base58::decode_check(zpub).unwrap();
         tpub[..4].copy_from_slice(&[0x04, 0x35, 0x87, 0xcf]);
