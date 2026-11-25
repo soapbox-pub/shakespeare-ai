@@ -216,16 +216,29 @@ touch credit, so a leaked one can do no more than spend up to its limit.
 - `DELETE /v1/keys/{id}`: revokes it, for good. It stays listed, with
   `revoked_at`.
 
-Like a balance, a limit is checked before a request and charged after it, so
-a key can end a little past its limit, and concurrent requests can each pass
-the check. Images are checked against the most they could cost. An account can
-have 100 keys that aren't revoked.
+A limit is checked before a request and charged after it, so a key can end
+a little past its limit, and concurrent requests can each pass the check. The
+owner's balance still pays: a limit is the owner's own cap, not credit.
+Images are checked against the most they could cost. An account can have 100
+keys that aren't revoked.
 
-A balance can end below zero the same way, by what was running when it ran
-out. An account (all its keys and NIP-98 together) may have only 4 inference
-requests in flight; a fifth is a 429, `too_many_concurrent_requests`. With
-`n` gone, that bounds how far below zero anyone can go: four requests, each as
-dear as its provider's own output limit allows.
+A balance is held, not just checked. Before calling a provider, a request
+sets aside what it's likely to cost: a chat its prompt (estimated from its
+text, and about 1,600 tokens an image) plus `max_tokens`, at most 4,096, of
+output; an image request the most it could cost. The check and the hold are
+one write transaction against the balance less every other hold, so
+concurrent requests can't all spend the same credit. Without enough to hold,
+a request is a 429, `insufficient_quota`, with `required` and `available`.
+The hold is given back in the transaction that charges the request, or when
+the request fails, and holds left by a server that stopped are cleared when
+it starts.
+
+A chat can still cost more than its hold, by output past 4,096 tokens, so a
+balance can end a little below zero. An account (all its keys and NIP-98
+together) may have only 4 inference requests in flight; a fifth is a 429,
+`too_many_concurrent_requests`. With `n` gone, that bounds how far below zero
+anyone can go: four requests, each past its hold by as much as its provider's
+own output limit allows.
 
 ## Storage
 
@@ -242,6 +255,8 @@ SQLite, schema in `src/db/migrations.rs`. Money is integer nanodollars.
   derivation index and the sats it's owed.
 - `api_keys` holds each key's hash, owner, limit and state. A key's spend is
   the sum of its generations' costs, so there's no counter to drift.
+- `holds` is the credit set aside for requests in flight. Holds aren't
+  ledger entries: they move no money, they only limit what can be spent.
 
 Anything that releases money (a payment completing, a gift card being
 redeemed or cancelled) is one conditional `UPDATE … RETURNING`, and credit
@@ -290,10 +305,12 @@ of their own, since their effects are already in the opening balances.
   `n` is gone. A field in the schema with the wrong shape is a 400. No client
   header is passed on, `Accept-Language` included. If OpenRouter reports a
   cost for a free model anyway, it's charged.
-- **Interrupted streams are charged for.** If a client hangs up before the
-  provider reports usage, tokens are estimated from bytes sent and received
-  (about four per token), and the generation is marked `estimated`. These used
-  to be free.
+- **Interrupted streams are charged for.** If a client hangs up, or stops
+  reading, the provider's stream is still read to its end and charged by the
+  usage it reports, as the provider charges us. Only a stream that ends with
+  no usage (a provider error mid-stream) is estimated, from bytes sent and
+  received (about four per token), and marked `estimated`. These used to be
+  free.
 - **Image cost follows what was made.** The charge uses the quality and size
   the provider reports. Without a `quality`, the balance check assumes high
   quality, because that's what the provider may pick. It used to charge low.

@@ -243,6 +243,31 @@ impl ChatRequest {
         self.stream.unwrap_or(false)
     }
 
+    /// The most output the client asked for, if it said.
+    pub fn max_output(&self) -> Option<u32> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
+
+    /// Roughly how many tokens the prompt is, before a provider says: its
+    /// text at about four bytes a token, and each image as a typical one.
+    /// (An image's bytes say nothing of its tokens: a provider scales it.)
+    pub fn prompt_tokens_estimate(&self) -> u64 {
+        /// About what a 1024×1024 image is to Claude or GPT.
+        const IMAGE_TOKENS: u64 = 1600;
+        fn walk(value: &Value, key: Option<&str>) -> (u64, u64) {
+            match value {
+                Value::String(_) if key == Some("url") => (0, 1),
+                Value::String(s) => (s.len() as u64, 0),
+                Value::Array(items) => items.iter().map(|v| walk(v, None)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)),
+                Value::Object(map) => map.iter().map(|(k, v)| walk(v, Some(k))).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)),
+                _ => (0, 0),
+            }
+        }
+        let (messages, images) = serde_json::to_value(&self.messages).map_or((0, 0), |v| walk(&v, None));
+        let (tools, _) = serde_json::to_value(&self.tools).map_or((0, 0), |v| walk(&v, None));
+        (messages + tools).div_ceil(4) + images * IMAGE_TOKENS
+    }
+
     /// The request for a provider, as a JSON object to add our own fields
     /// to: `model` is the provider's id, and OpenRouter gets its own spelling
     /// of reasoning effort and the reasoning blocks it sent before.

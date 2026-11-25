@@ -38,18 +38,21 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     let n = params.n.unwrap_or(1);
     let most = per_image(price, params.quality.as_deref().unwrap_or("high"), params.size.as_deref()).checked_mul(i64::from(n)).unwrap_or(Money(i64::MAX));
     app.check_key_limit(&caller, most).await?;
-    let who = pubkey.clone();
-    let balance = app.db.call(move |conn| store::balance(conn, &who)).await?;
-    if balance < most {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "insufficient_quota",
-            "insufficient_quota",
-            format!("You need {} credits to generate {n} image(s), but you only have {} credits available", most.to_f64(), balance.to_f64()),
-        )
-        .with("required", most.to_f64())
-        .with("available", balance.to_f64()));
-    }
+    // Held, not just checked, so requests in flight together can't all
+    // spend the same credit; given back by the charge, or if this fails.
+    let mut hold = match app.hold(&pubkey, most).await? {
+        Ok(hold) => hold,
+        Err(available) => {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "insufficient_quota",
+                "insufficient_quota",
+                format!("You need {} credits to generate {n} image(s), but you only have {} credits available", most.to_f64(), available.to_f64()),
+            )
+            .with("required", most.to_f64())
+            .with("available", available.to_f64()));
+        }
+    };
 
     let mut body = Map::new();
     body.insert("prompt".into(), params.prompt.clone().into());
@@ -108,14 +111,18 @@ pub async fn generations(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     };
     let id = generation.id.clone();
     app.metrics.usage(&params.model, 0, u64::from(made), cost);
-    let recorded = app.db.call(move |conn| store::record_generation(conn, &generation)).await;
+    let held = hold.id().map(str::to_string);
+    let recorded = app.db.call(move |conn| store::record_generation(conn, &generation, held.as_deref())).await;
     let fields = json!({
         "pubkey": pubkey, "api_key": caller.api_key_id(), "model": params.model, "cost": cost.to_f64(), "upstream": upstream.label(),
         "images": made, "quality": result.get("quality").and_then(Value::as_str).unwrap_or(quality), "size": size,
         "output_tokens": tokens.map(|(_, t)| t.output), "id": id,
     });
     match recorded {
-        Ok(()) => crate::log::info("image.generation", fields),
+        Ok(()) => {
+            hold.settled();
+            crate::log::info("image.generation", fields);
+        }
         Err(error) => crate::log::error("image.unrecorded", json!({ "generation": fields, "error": format!("{error:#}") })),
     }
 

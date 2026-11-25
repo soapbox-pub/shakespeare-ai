@@ -70,10 +70,10 @@ impl SeenEvents {
 
 /// How many inference requests one account may have running at once.
 ///
-/// Credit is checked before a request and charged after it, so a balance can
-/// end below zero by what was in flight when it ran out. This is what bounds
-/// that: at most this many requests, each as dear as a provider's own output
-/// limit lets it be.
+/// Each request holds what it's likely to cost before it starts (see
+/// [`Hold`]), but a chat's cost isn't known until it's done, and can pass its
+/// hold. This bounds by how much: at most this many requests, each as dear as
+/// a provider's own output limit lets it be.
 pub const MAX_IN_FLIGHT: usize = 4;
 
 /// One of an account's [`MAX_IN_FLIGHT`] places, given back when dropped:
@@ -95,7 +95,62 @@ impl Drop for Slot {
     }
 }
 
+/// Credit set aside for one inference request, until it's charged: given
+/// back by the charge itself ([`store::record_generation`]) or, if the
+/// request ends some other way, when this is dropped.
+pub struct Hold {
+    app: Arc<App>,
+    id: Option<String>,
+}
+
+impl Hold {
+    /// A request that costs nothing holds nothing.
+    pub fn none(app: &Arc<App>) -> Hold {
+        Hold { app: app.clone(), id: None }
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    /// The charge gave it back.
+    pub fn settled(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let db = self.app.db.clone();
+        let release = move |conn: &mut rusqlite::Connection| store::release_hold(conn, &id);
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = db.call(release).await {
+                        crate::log::error("holds.release", serde_json::json!({ "error": format!("{error:#}") }));
+                    }
+                });
+                Ok(())
+            }
+            Err(_) => db.with(release),
+        };
+        if let Err(error) = result {
+            crate::log::error("holds.release", serde_json::json!({ "error": format!("{error:#}") }));
+        }
+    }
+}
+
 impl App {
+    /// Set `amount` aside from `pubkey`'s credit for a request, or say how
+    /// much it could spend instead.
+    pub async fn hold(self: &Arc<Self>, pubkey: &str, amount: Money) -> Result<Result<Hold, Money>, ApiError> {
+        let who = pubkey.to_string();
+        let now = crate::util::now();
+        let placed = self.db.call(move |conn| store::place_hold(conn, &who, amount, now)).await?;
+        Ok(placed.map(|id| Hold { app: self.clone(), id: Some(id) }))
+    }
+
     pub fn new(config: Config, db: Db) -> anyhow::Result<App> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("shakespeare-ai/", env!("CARGO_PKG_VERSION")))

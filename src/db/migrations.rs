@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -183,4 +183,20 @@ ALTER TABLE generations ADD COLUMN upstream_cost INTEGER;
 -- Of prompt_tokens, those read from and written to the provider's cache.
 ALTER TABLE generations ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE generations ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// Credit set aside for inference requests in flight.
+const HOLDS: &str = r#"
+-- What each request in flight might cost, taken out of what its account can
+-- spend until the request is charged. Not money moved: the ledger and
+-- balances don't see them. A hold belongs to a request in this process, so
+-- any left at startup are from one that died, and are cleared.
+CREATE TABLE holds (
+    id TEXT PRIMARY KEY,
+    pubkey TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount >= 0),
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX holds_pubkey ON holds (pubkey, amount);
 "#;

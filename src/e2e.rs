@@ -508,21 +508,86 @@ async fn limits_the_requests_an_account_has_in_flight() {
 }
 
 #[tokio::test]
-async fn charges_an_estimate_when_the_client_hangs_up() {
+async fn charges_reported_usage_when_the_client_hangs_up() {
     let (app, _t) = setup().await;
     give(&app, 1);
     let request = signed("POST", "/v1/chat/completions", Some(json!({ "model": "paid", "stream": true, "messages": [{ "role": "user", "content": "hi" }] })));
     let response = router(app.clone()).oneshot(request).await.unwrap();
     let mut body = response.into_body().into_data_stream();
     body.next().await.unwrap().unwrap();
+    // Gone before the usage arrives: the provider's stream is still read to
+    // its end, and charged by what it reports, not an estimate.
     drop(body);
 
-    let rows = wait_for_generations(&app, 1).await;
-    assert_eq!(rows.len(), 1);
-    let (cost, estimated) = rows[0];
-    assert_eq!(estimated, 1);
-    assert!(cost > 0);
-    assert_eq!(balance(&app), Money(1_000_000_000 - cost));
+    assert_eq!(wait_for_generations(&app, 1).await, vec![(33_000_000, 0)]);
+    assert_eq!(balance(&app), Money(1_000_000_000 - 33_000_000));
+    assert_eq!(holds(&app), 0);
+}
+
+fn holds(app: &App) -> i64 {
+    app.db.with(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM holds", [], |r| r.get(0))?)).unwrap()
+}
+
+fn give_nanos(app: &App, nanos: i64) {
+    let pubkey = public_key(SECRET);
+    app.db
+        .with(|conn| {
+            let tx = store::write_tx(conn)?;
+            store::post(&tx, &pubkey, Money(nanos), store::Kind::Opening, &pubkey, 0)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn holds_credit_for_requests_in_flight() {
+    let (app, _t) = setup().await;
+    // $0.10: enough to hold for one request of 4096 tokens out at $15/M
+    // ($0.061), not two.
+    give_nanos(&app, 100_000_000);
+    let stream = |extra: Value| {
+        let mut body = json!({ "model": "paid", "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        signed("POST", "/v1/chat/completions", Some(body))
+    };
+    let first = router(app.clone()).oneshot(stream(json!({}))).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(holds(&app), 1);
+
+    // The balance is still $0.10, but most of it is held.
+    let (status, body) = json_of(router(app.clone()).oneshot(stream(json!({}))).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("insufficient_quota")), "{body}");
+    assert!(body["error"]["available"].as_f64().unwrap() < 0.04, "{body}");
+    let image = signed("POST", "/v1/images/generations", Some(json!({ "model": "gpt-image-1", "prompt": "a cat" })));
+    assert_eq!(router(app.clone()).oneshot(image).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+    // Asking for less output holds less.
+    let small = router(app.clone()).oneshot(stream(json!({ "max_tokens": 100 }))).await.unwrap();
+    assert_eq!(small.status(), StatusCode::OK);
+
+    // Each charge gives its hold back.
+    drop((first, small));
+    wait_for_generations(&app, 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(holds(&app), 0);
+    assert_eq!(balance(&app), Money(100_000_000 - 2 * 33_000_000));
+}
+
+#[tokio::test]
+async fn gives_a_hold_back_when_the_request_fails() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let chat = signed("POST", "/v1/chat/completions", Some(json!({ "model": "refused", "messages": [{ "role": "user", "content": "hi" }] })));
+    let (status, _) = json_of(router(app.clone()).oneshot(chat).await.unwrap()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for _ in 0..50 {
+        if holds(&app) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(holds(&app), 0);
+    assert_eq!(balance(&app), Money(1_000_000_000));
 }
 
 #[tokio::test]

@@ -65,7 +65,7 @@ function Usage() {
                     {generation.estimated ? (
                       <Tooltip>
                         <TooltipTrigger className="underline decoration-dotted underline-offset-4">≈ {usd(generation.cost)}</TooltipTrigger>
-                        <TooltipContent>The client hung up before the provider counted the tokens, so they were estimated.</TooltipContent>
+                        <TooltipContent>The provider never reported the tokens, so they were estimated.</TooltipContent>
                       </Tooltip>
                     ) : (
                       usd(generation.cost)

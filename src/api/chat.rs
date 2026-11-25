@@ -17,10 +17,16 @@ use super::anthropic;
 use super::schema::ChatRequest;
 use super::upstream::{self, upstream_failure, Failure};
 use super::ApiError;
-use crate::app::App;
+use crate::app::{App, Hold};
 use crate::config::{Api, Kind, Provider, TokenPrice, Tokens, Upstream};
 use crate::money::{decimal_from_json_number, Money};
 use crate::store::{self, Generation};
+
+/// The most output a chat request holds credit for, fewer if it asks for
+/// less. More would refuse small balances most requests fit in; what a
+/// request costs past its hold is still charged, and [`crate::app::MAX_IN_FLIGHT`]
+/// bounds that.
+const HELD_OUTPUT_TOKENS: u32 = 4096;
 
 pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let caller = app.authenticate_inference(&method, &uri, &headers, &body).await?;
@@ -32,28 +38,44 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
     let model_id = request.model.clone();
     let not_found = || ApiError::invalid("model_not_found", format!("Model '{model_id}' is not supported")).param("model");
     let model = app.config.models.get(&model_id).ok_or_else(not_found)?;
-    let Kind::Chat { price, .. } = &model.kind else {
+    let Kind::Chat { price, context_window } = &model.kind else {
         return Err(ApiError::invalid("invalid_model_type", format!("Model '{model_id}' cannot be used with the chat completions endpoint"))
             .param("model"));
     };
     let free = model.is_free_chat();
     let slot = app.take_slot(&caller.pubkey)?;
 
-    // Credit is checked before and charged after: a request's cost isn't
-    // known until it's done, so a balance can end a little below zero.
-    if !free {
+    // A request's cost isn't known until it's done, so what it's likely to
+    // cost is held first, and the hold is given back when it's charged.
+    // Requests in flight together each see the others' holds, so they can't
+    // all spend the same credit.
+    let hold = if free {
+        Hold::none(&app)
+    } else {
         app.check_key_limit(&caller, Money::ZERO).await?;
-        let who = caller.pubkey.clone();
-        let balance = app.db.call(move |conn| store::balance(conn, &who)).await?;
-        if !balance.is_positive() {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "insufficient_quota",
-                "insufficient_quota",
-                "You have run out of credits. Please add more credits to continue using the service.",
-            ));
+        let held = price.cost(Tokens {
+            input: request.prompt_tokens_estimate().min(*context_window),
+            output: u64::from(request.max_output().map_or(HELD_OUTPUT_TOKENS, |max| max.min(HELD_OUTPUT_TOKENS))),
+            ..Tokens::default()
+        });
+        match app.hold(&caller.pubkey, held).await? {
+            Ok(hold) => hold,
+            Err(available) => {
+                let message = if available.is_positive() {
+                    format!(
+                        "This request needs about {} credits, but you only have {} credits available. Please add more credits to continue using the service.",
+                        held.to_f64(),
+                        available.to_f64()
+                    )
+                } else {
+                    "You have run out of credits. Please add more credits to continue using the service.".to_string()
+                };
+                return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", "insufficient_quota", message)
+                    .with("required", held.to_f64())
+                    .with("available", available.to_f64()));
+            }
         }
-    }
+    };
 
     let stream = request.is_stream();
     let first_byte_timeout = app.config.routing.first_byte_timeout;
@@ -86,7 +108,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
 
     let api = app.config.providers.get(&upstream.provider).map_or(Api::Openai, |p| p.api);
     let openrouter = api == Api::Openrouter;
-    let meter = Meter {
+    let mut meter = Meter {
         app: app.clone(),
         api_key_id: caller.api_key_id(),
         pubkey: caller.pubkey,
@@ -97,6 +119,7 @@ pub async fn completions(State(app): State<Arc<App>>, method: Method, uri: Uri, 
         free,
         openrouter,
         prompt_bytes: attempt.prompt_bytes,
+        hold,
         _slot: slot,
     };
 
@@ -212,6 +235,8 @@ struct Meter {
     /// OpenRouter reports what each request cost us.
     openrouter: bool,
     prompt_bytes: usize,
+    /// The credit set aside for it, given back by its charge.
+    hold: Hold,
     /// Held until the generation is charged, however it ends.
     _slot: crate::app::Slot,
 }
@@ -302,7 +327,7 @@ impl Meter {
         }
     }
 
-    async fn record(&self, upstream_id: Option<String>, charge: &Charge, stream: bool) {
+    async fn record(&mut self, upstream_id: Option<String>, charge: &Charge, stream: bool) {
         let t = charge.tokens;
         let generation = Generation {
             id: store::new_generation_id(),
@@ -337,9 +362,13 @@ impl Meter {
             "estimated": charge.estimated,
             "id": upstream_id,
         });
-        let result = self.app.db.call(move |conn| store::record_generation(conn, &generation)).await;
+        let hold = self.hold.id().map(str::to_string);
+        let result = self.app.db.call(move |conn| store::record_generation(conn, &generation, hold.as_deref())).await;
         match result {
-            Ok(()) => crate::log::info("chat.completion", fields),
+            Ok(()) => {
+                self.hold.settled();
+                crate::log::info("chat.completion", fields);
+            }
             // The completion was delivered; losing its charge is ours to
             // notice and fix by hand.
             Err(error) => crate::log::error("chat.unrecorded", json!({ "completion": fields, "error": format!("{error:#}") })),
@@ -350,11 +379,19 @@ impl Meter {
 /// Relay the provider's event stream to the client, rewritten to name our
 /// model and carry our cost, and charge once it ends.
 ///
-/// The relaying runs in a task of its own, so that if the client goes away
-/// the generation is still charged for: by its reported usage if that has
-/// arrived, or else by an estimate of what was sent and received.
-fn stream_response(meter: Meter, mut events: BoxStream<'static, reqwest::Result<Bytes>>, mut anthropic: Option<anthropic::Stream>) -> Response {
-    let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+/// The relaying runs in a task of its own, and reads the provider's stream to
+/// its end whatever the client does, so the generation is charged by the
+/// usage the provider reports (what it charges us): a client can't escape
+/// that by hanging up before the usage arrives, or by not reading. Only if
+/// the provider never reports usage is it charged an estimate of what was
+/// sent and received.
+///
+/// The channel to the client is unbounded so that a client that stops
+/// reading can't hold up the reading of the provider's stream, and with it
+/// the charge. What it buffers is one completion, at most the provider's
+/// output limit.
+fn stream_response(mut meter: Meter, mut events: BoxStream<'static, reqwest::Result<Bytes>>, mut anthropic: Option<anthropic::Stream>) -> Response {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
     tokio::spawn(async move {
         let mut parser = SseParser::default();
         let mut state = StreamState::default();
@@ -373,14 +410,14 @@ fn stream_response(meter: Meter, mut events: BoxStream<'static, reqwest::Result<
                     break 'read;
                 }
                 let Some(out) = state.rewrite(&meter, &data) else { continue };
-                if tx.send(out).await.is_err() {
+                // Gone, it's still read for its usage; just not sent.
+                if !client_gone && tx.send(out).is_err() {
                     client_gone = true;
-                    break 'read;
                 }
             }
         }
         if !client_gone {
-            let _ = tx.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
+            let _ = tx.send(Bytes::from_static(b"data: [DONE]\n\n"));
         }
         drop(tx);
 

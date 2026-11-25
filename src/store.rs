@@ -430,9 +430,13 @@ pub fn new_generation_id() -> String {
     format!("gen_{}", random_hex(32))
 }
 
-/// Record a generation and charge for it, together.
-pub fn record_generation(conn: &mut Connection, g: &Generation) -> Result<()> {
+/// Record a generation and charge for it, together, giving back the hold
+/// that was taken for it, if one was.
+pub fn record_generation(conn: &mut Connection, g: &Generation, hold: Option<&str>) -> Result<()> {
     let tx = write_tx(conn)?;
+    if let Some(hold) = hold {
+        tx.execute("DELETE FROM holds WHERE id = ?", [hold])?;
+    }
     tx.execute(
         "INSERT INTO generations (id, upstream_id, pubkey, model, created_at, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
              cost, estimated, api_key_id, upstream, upstream_cost)
@@ -459,6 +463,45 @@ pub fn record_generation(conn: &mut Connection, g: &Generation) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+// Holds.
+
+/// What an account can spend now: its balance, less what's held for its
+/// requests in flight.
+pub fn spendable(conn: &Connection, pubkey: &str) -> Result<Money> {
+    let held: i64 = conn.query_row("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE pubkey = ?", [pubkey], |r| r.get(0))?;
+    Ok(Money(balance(conn, pubkey)?.nanos().saturating_sub(held)))
+}
+
+/// Set `amount` aside for a request, if the account can spend that much and
+/// more than nothing. The hold's id, or what the account could spend.
+///
+/// The check and the hold are one write transaction, so requests racing each
+/// other can't all pass a check that only one of them should: each sees the
+/// holds of those before it.
+pub fn place_hold(conn: &mut Connection, pubkey: &str, amount: Money, now: i64) -> Result<Result<String, Money>> {
+    let tx = write_tx(conn)?;
+    let available = spendable(&tx, pubkey)?;
+    if !available.is_positive() || available < amount {
+        return Ok(Err(available));
+    }
+    let id = format!("hold_{}", random_hex(24));
+    tx.execute("INSERT INTO holds (id, pubkey, amount, created_at) VALUES (?, ?, ?, ?)", params![id, pubkey, amount.nanos().max(0), now])?;
+    tx.commit()?;
+    Ok(Ok(id))
+}
+
+/// Give back a hold without charging anything. Releasing one already gone
+/// does nothing.
+pub fn release_hold(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM holds WHERE id = ?", [id])?;
+    Ok(())
+}
+
+/// Forget every hold: at startup, when no request is in flight.
+pub fn clear_holds(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM holds", [])?)
 }
 
 pub fn list_generations(conn: &Connection, pubkey: &str, limit: usize, after: Option<&str>) -> Result<(Vec<Generation>, bool)> {
@@ -914,6 +957,7 @@ mod tests {
                         upstream: Some("p/m".into()),
                         upstream_cost: Some(Money(2)),
                     },
+                    None,
                 )?;
             }
             let (first, more) = list_generations(conn, ALICE, 2, None)?;

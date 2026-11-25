@@ -84,6 +84,12 @@ fn main() -> Result<()> {
 }
 
 fn serve(config: Config, db: Db) -> Result<()> {
+    // Holds belong to requests in flight; any here now are from a server
+    // that stopped mid-request, and would keep their credit out of reach.
+    let cleared = db.with(|conn| store::clear_holds(conn))?;
+    if cleared > 0 {
+        log::warn("holds.cleared", serde_json::json!({ "holds": cleared }));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
         let (listen, metrics_listen) = (config.listen, config.metrics_listen);
