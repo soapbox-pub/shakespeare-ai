@@ -315,11 +315,13 @@ touch credit, so a leaked one can do no more than spend up to its limit.
 - `DELETE /v1/keys/{id}`: revokes it, for good. It stays listed, with
   `revoked_at`.
 
-A limit is checked before a request and charged after it, so a key can end
-a little past its limit, and concurrent requests can each pass the check. The
-owner's balance still pays: a limit is the owner's own cap, not credit.
-Images are checked against the most they could cost. An account can have 100
-keys that aren't revoked.
+A limit is checked when a request's credit is held (below), against what the
+key has spent less what its other requests in flight hold: a chat needs some
+of it left, and an image request the most it could cost. It's charged after,
+so a key can end a little past its limit, but concurrent requests can't each
+spend the same part of it. The owner's balance still pays: a limit is the
+owner's own cap, not credit. An account can have 100 keys that aren't
+revoked.
 
 A balance is held, not just checked. Before calling a provider, a request
 sets aside what it's likely to cost: a chat its prompt (estimated from all

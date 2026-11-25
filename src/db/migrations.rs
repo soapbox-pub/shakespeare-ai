@@ -3,7 +3,7 @@
 //! Money is INTEGER nanodollars throughout (see `money.rs`), and times are
 //! INTEGER Unix seconds.
 
-pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP), ("008_bitcoin_advances", BITCOIN_ADVANCES), ("009_monero", MONERO)];
+pub const MIGRATIONS: &[(&str, &str)] = &[("001_initial", INITIAL), ("002_bitcoin", BITCOIN), ("003_api_keys", API_KEYS), ("004_upstreams", UPSTREAMS), ("005_holds", HOLDS), ("006_bitcoin_checks", BITCOIN_CHECKS), ("007_payment_cleanup", PAYMENT_CLEANUP), ("008_bitcoin_advances", BITCOIN_ADVANCES), ("009_monero", MONERO), ("010_hold_keys", HOLD_KEYS)];
 
 const INITIAL: &str = r#"
 -- Every movement of credit, ever. Rows are only ever inserted. A balance is
@@ -310,4 +310,11 @@ CREATE TABLE monero_accounts (
     account TEXT PRIMARY KEY,
     next_idx INTEGER NOT NULL CHECK (next_idx > 0)
 ) STRICT;
+"#;
+
+/// The API key each hold is for, so a key's requests in flight count
+/// against its spend limit as they do against its owner's credit.
+const HOLD_KEYS: &str = r#"
+ALTER TABLE holds ADD COLUMN api_key_id TEXT;
+CREATE INDEX holds_api_key ON holds (api_key_id, amount) WHERE api_key_id IS NOT NULL;
 "#;

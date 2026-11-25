@@ -142,13 +142,26 @@ impl Drop for Hold {
 }
 
 impl App {
-    /// Set `amount` aside from `pubkey`'s credit for a request, or say how
-    /// much it could spend instead.
-    pub async fn hold(self: &Arc<Self>, pubkey: &str, amount: Money) -> Result<Result<Hold, Money>, ApiError> {
-        let who = pubkey.to_string();
+    /// Set `amount` aside from the caller's credit for a request, or say how
+    /// much it could spend instead. A key with a spend limit must have
+    /// `needed` of it left, and more than nothing, after what its other
+    /// requests in flight hold; NIP-98 has no limit.
+    pub async fn hold(self: &Arc<Self>, caller: &Caller, amount: Money, needed: Money) -> Result<Result<Hold, Money>, ApiError> {
+        let who = caller.pubkey.clone();
         let now = crate::util::now();
-        let placed = self.db.call(move |conn| store::place_hold(conn, &who, amount, now)).await?;
-        Ok(placed.map(|id| Hold { app: self.clone(), id: Some(id) }))
+        let key = caller.api_key.as_ref().and_then(|key| Some((key.id.clone(), key.limit?, key.limit_since(now))));
+        let placed = self
+            .db
+            .call(move |conn| {
+                let key = key.as_ref().map(|(id, limit, since)| store::KeyLimit { id, limit: *limit, since: *since, needed });
+                store::place_hold(conn, &who, amount, key, now)
+            })
+            .await?;
+        match placed {
+            Ok(id) => Ok(Ok(Hold { app: self.clone(), id: Some(id) })),
+            Err(store::HoldRefused::Credit(available)) => Ok(Err(available)),
+            Err(store::HoldRefused::KeyLimit(remaining)) => Err(key_limit_exceeded(caller.api_key.as_ref(), remaining)),
+        }
     }
 
     pub fn new(config: Config, db: Db) -> anyhow::Result<App> {
@@ -249,28 +262,20 @@ impl App {
             Some(Unusable::Expired) => Err(error("api_key_expired", "This API key has expired")),
         }
     }
+}
 
-    /// Refuse a request an API key's spend limit can't cover: `needed` more
-    /// than it has left, or nothing left at all. NIP-98 has no limit.
-    pub async fn check_key_limit(&self, caller: &Caller, needed: Money) -> Result<(), ApiError> {
-        let Some(key) = &caller.api_key else { return Ok(()) };
-        let Some(limit) = key.limit else { return Ok(()) };
-        let (id, since) = (key.id.clone(), key.limit_since(crate::util::now()));
-        let spent = self.db.call(move |conn| store::api_key_spent(conn, &id, since)).await?;
-        let remaining = Money(limit.nanos().saturating_sub(spent.nanos()).max(0));
-        if !remaining.is_positive() || remaining < needed {
-            let period = key.limit_reset.map_or(String::new(), |r| format!(" {}", r.as_str()));
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "insufficient_quota",
-                "key_limit_exceeded",
-                format!("This API key has reached its{period} spending limit of {} credits", limit.to_f64()),
-            )
-            .with("limit", limit.to_f64())
-            .with("limit_remaining", remaining.to_f64()));
-        }
-        Ok(())
-    }
+/// The error for a request an API key's spend limit can't cover.
+fn key_limit_exceeded(key: Option<&ApiKey>, remaining: Money) -> ApiError {
+    let limit = key.and_then(|k| k.limit).unwrap_or(Money::ZERO);
+    let period = key.and_then(|k| k.limit_reset).map_or(String::new(), |r| format!(" {}", r.as_str()));
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "insufficient_quota",
+        "key_limit_exceeded",
+        format!("This API key has reached its{period} spending limit of {} credits", limit.to_f64()),
+    )
+    .with("limit", limit.to_f64())
+    .with("limit_remaining", remaining.to_f64())
 }
 
 /// Who an inference request is from, and the key it came with, if any.

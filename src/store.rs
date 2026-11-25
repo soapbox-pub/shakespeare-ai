@@ -849,20 +849,50 @@ pub fn spendable(conn: &Connection, pubkey: &str) -> Result<Money> {
     Ok(Money(balance(conn, pubkey)?.nanos().saturating_add(advances(conn, pubkey)?.nanos()).saturating_sub(held(conn, pubkey)?)))
 }
 
+/// An API key's spend limit, as a hold checks it: what it may spend since
+/// `since`, and how much of that must be left for this request.
+pub struct KeyLimit<'a> {
+    pub id: &'a str,
+    pub limit: Money,
+    pub since: i64,
+    pub needed: Money,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HoldRefused {
+    /// The account can't spend that much; what it could.
+    Credit(Money),
+    /// The key's limit hasn't that much left; what it has.
+    KeyLimit(Money),
+}
+
 /// Set `amount` aside for a request, if the account can spend that much and
-/// more than nothing. The hold's id, or what the account could spend.
+/// more than nothing, and the key it came with, if it has a limit, has
+/// `needed` of it left and more than nothing. The hold's id, or why not.
 ///
-/// The check and the hold are one write transaction, so requests racing each
-/// other can't all pass a check that only one of them should: each sees the
-/// holds of those before it.
-pub fn place_hold(conn: &mut Connection, pubkey: &str, amount: Money, now: i64) -> Result<Result<String, Money>> {
+/// The checks and the hold are one write transaction, so requests racing
+/// each other can't all pass a check that only one of them should: each sees
+/// the holds of those before it, against the account's credit and against
+/// the key's limit.
+pub fn place_hold(conn: &mut Connection, pubkey: &str, amount: Money, key: Option<KeyLimit>, now: i64) -> Result<Result<String, HoldRefused>> {
     let tx = write_tx(conn)?;
     let available = spendable(&tx, pubkey)?;
     if !available.is_positive() || available < amount {
-        return Ok(Err(available));
+        return Ok(Err(HoldRefused::Credit(available)));
+    }
+    if let Some(key) = &key {
+        let held: i64 = tx.query_row("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE api_key_id = ?", [key.id], |r| r.get(0))?;
+        let spent = api_key_spent(&tx, key.id, key.since)?;
+        let remaining = Money(key.limit.nanos().saturating_sub(spent.nanos()).saturating_sub(held));
+        if !remaining.is_positive() || remaining < key.needed {
+            return Ok(Err(HoldRefused::KeyLimit(remaining.max(Money::ZERO))));
+        }
     }
     let id = format!("hold_{}", random_hex(24));
-    tx.execute("INSERT INTO holds (id, pubkey, amount, created_at) VALUES (?, ?, ?, ?)", params![id, pubkey, amount.nanos().max(0), now])?;
+    tx.execute(
+        "INSERT INTO holds (id, pubkey, amount, created_at, api_key_id) VALUES (?, ?, ?, ?, ?)",
+        params![id, pubkey, amount.nanos().max(0), now, key.as_ref().map(|k| k.id)],
+    )?;
     tx.commit()?;
     Ok(Ok(id))
 }
@@ -1536,7 +1566,7 @@ mod tests {
             let five = DOLLAR.checked_mul(5).unwrap();
             // A request in flight holds $6 of the $10: what it will be charged
             // can't be given away on a card before it is.
-            let hold = place_hold(conn, ALICE, DOLLAR.checked_mul(6).unwrap(), 2)?.unwrap();
+            let hold = place_hold(conn, ALICE, DOLLAR.checked_mul(6).unwrap(), None, 2)?.unwrap();
             assert_eq!(
                 create_giftcards(conn, ALICE, five, 1, true, 2)?.unwrap_err(),
                 GiftcardError::Insufficient { required: five, available: DOLLAR.checked_mul(4).unwrap() }

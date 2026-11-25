@@ -42,10 +42,9 @@ async fn generate(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap, b
     // have: without a quality it picks one itself.
     let n = params.n.unwrap_or(1);
     let most = per_image(price, params.quality.as_deref().unwrap_or("high"), params.size.as_deref()).checked_mul(i64::from(n)).unwrap_or(Money(i64::MAX));
-    app.check_key_limit(&caller, most).await?;
     // Held, not just checked, so requests in flight together can't all
     // spend the same credit; given back by the charge, or if this fails.
-    let mut hold = match app.hold(&pubkey, most).await? {
+    let mut hold = match app.hold(&caller, most, most).await? {
         Ok(hold) => hold,
         Err(available) => {
             return Err(ApiError::new(

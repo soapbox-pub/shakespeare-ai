@@ -59,13 +59,13 @@ async fn complete(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap, b
     let hold = if free {
         Hold::none(&app)
     } else {
-        app.check_key_limit(&caller, Money::ZERO).await?;
         let held = price.cost(Tokens {
             input: request.prompt_tokens_estimate().min(*context_window),
             output: u64::from(request.max_output().map_or(HELD_OUTPUT_TOKENS, |max| max.min(HELD_OUTPUT_TOKENS))),
             ..Tokens::default()
         });
-        match app.hold(&caller.pubkey, held).await? {
+        // A key's limit need only have something left: the hold is a guess.
+        match app.hold(&caller, held, Money::ZERO).await? {
             Ok(hold) => hold,
             Err(available) => {
                 let message = if available.is_positive() {

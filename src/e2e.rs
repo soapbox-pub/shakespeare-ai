@@ -1224,6 +1224,32 @@ async fn api_keys_spend_their_owners_credit_within_their_limits() {
 }
 
 #[tokio::test]
+async fn counts_a_keys_requests_in_flight_against_its_limit() {
+    let (app, _t) = setup().await;
+    give(&app, 1);
+    let (_, created) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/keys", Some(json!({ "limit": 0.05 })))).await.unwrap()).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let stream = || with_key("POST", "/v1/chat/completions", &key, Some(json!({ "model": "paid", "stream": true, "messages": [{ "role": "user", "content": "hi" }] })));
+
+    // The first holds $0.061 of the key's $0.05, so the next can't start
+    // until it's charged, though the account has credit for both.
+    let first = router(app.clone()).oneshot(stream()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let (status, body) = json_of(router(app.clone()).oneshot(stream()).await.unwrap()).await;
+    assert_eq!((status, &body["error"]["code"]), (StatusCode::TOO_MANY_REQUESTS, &json!("key_limit_exceeded")), "{body}");
+    assert_eq!(body["error"]["limit_remaining"], 0.0);
+    // NIP-98 has no limit.
+    let signed_stream = signed("POST", "/v1/chat/completions", Some(json!({ "model": "paid", "stream": true, "messages": [{ "role": "user", "content": "hi" }] })));
+    assert_eq!(router(app.clone()).oneshot(signed_stream).await.unwrap().status(), StatusCode::OK);
+
+    // Charged $0.033, it leaves $0.017 to start another.
+    drop(first);
+    wait_for_generations(&app, 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(router(app.clone()).oneshot(stream()).await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn validates_api_keys() {
     let (app, _t) = setup().await;
     let call = |request| {
