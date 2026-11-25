@@ -421,13 +421,20 @@ async fn observe(State(app): State<Arc<App>>, mut request: Request, next: Next) 
         "http.response",
         serde_json::json!({
             "method": method.as_str(),
-            "pathname": pathname,
+            "pathname": logged_path(&route, &pathname),
             "status": status,
             "duration": start.elapsed().as_secs_f64(),
             "ip": ip.map(|ip| ip.to_string()),
         }),
     );
     response
+}
+
+/// A request's path as it's logged: as it came, unless it carries a secret,
+/// as a gift card's code does when it's checked. Anyone who reads the logs
+/// could redeem a code written there, so such a path is logged as its route.
+fn logged_path<'a>(route: &'a str, pathname: &'a str) -> &'a str {
+    if route.contains("{code}") { route } else { pathname }
 }
 
 /// Fixed hourly windows per client IP, for the endpoints that guess at gift
@@ -482,6 +489,14 @@ fn limited_as(ip: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_no_gift_card_codes() {
+        let route = "/v1/credits/giftcards/check/{code}";
+        assert_eq!(logged_path(route, "/v1/credits/giftcards/check/ABCD-EFGH-IJKL-MNOP"), route);
+        assert_eq!(logged_path("/v1/credits/payments/{payment_id}", "/v1/credits/payments/pi_1"), "/v1/credits/payments/pi_1");
+        assert_eq!(logged_path("unmatched", "/docs"), "/docs");
+    }
 
     #[test]
     fn limits_ipv6_by_its_64() {
