@@ -25,8 +25,10 @@ impl Money {
         self.0
     }
 
+    /// `None` if it's more nanodollars than an `i64` holds. Checked, as
+    /// amounts come from requests: `Decimal`'s `*` panics on overflow.
     pub fn from_dollars(dollars: Decimal) -> Option<Money> {
-        let nanos = (dollars * Decimal::from(NANOS_PER_DOLLAR)).round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero);
+        let nanos = dollars.checked_mul(Decimal::from(NANOS_PER_DOLLAR))?.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero);
         nanos.to_i64().map(Money)
     }
 
@@ -126,5 +128,7 @@ mod tests {
         assert_eq!(Money(10_000_001).to_cents_ceil(), 2);
         assert_eq!(Money::from_dollars(Decimal::from_str("0.0000000005").unwrap()).unwrap().0, 1);
         assert_eq!(Money::from_dollars(Decimal::from_str("1.005").unwrap()).unwrap().round_to_cents().0, 1_010_000_000);
+        assert_eq!(Money::from_dollars(Decimal::MAX), None);
+        assert_eq!(Money::from_dollars(Decimal::from_str("10000000000").unwrap()), None);
     }
 }

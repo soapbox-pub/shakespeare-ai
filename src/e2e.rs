@@ -774,6 +774,11 @@ async fn validates_requests() {
     let (status, body) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/add", Some(json!({ "amount": 1, "method": "stripe" })))).await.unwrap()).await;
     assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("minimum_amount_not_met")));
     assert_eq!(body["error"]["minimum_amount"], 5.0);
+    // Too many dollars to count is refused, not a panic.
+    for path in ["/v1/credits/add", "/v1/credits/giftcards"] {
+        let (status, body) = json_of(router(app.clone()).oneshot(signed("POST", path, Some(json!({ "amount": 5e28, "method": "stripe" })))).await.unwrap()).await;
+        assert_eq!((status, &body["error"]["code"]), (StatusCode::BAD_REQUEST, &json!("invalid_parameter")), "{path}");
+    }
     // Not configured here, so not supported.
     let (_, body) = json_of(router(app.clone()).oneshot(signed("POST", "/v1/credits/add", Some(json!({ "amount": 10, "method": "lightning" })))).await.unwrap()).await;
     assert_eq!(body["error"]["code"], "unsupported_method");
