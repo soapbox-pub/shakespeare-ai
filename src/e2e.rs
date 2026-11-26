@@ -878,13 +878,12 @@ async fn sells_credits_for_onchain_bitcoin() {
     let (_, credits) = json_of(router(app.clone()).oneshot(get("/v1/credits")).await.unwrap()).await;
     assert_eq!((credits["amount"].as_f64(), credits["pending"].as_f64()), (Some(10.0), Some(0.0)));
 
-    // Short by half: not yet, as a top-up could still come; once its time is
-    // up, credited for what was paid.
-    esplora.pay(SECOND, 5_500, Some(800_000));
+    // Short by half: credited for what was paid as soon as it's confirmed,
+    // in its time, without waiting for a top-up.
+    esplora.pay(SECOND, 5_500, Some(800_001));
     crate::payments::check_bitcoin_payments(&app).await.unwrap();
     assert_eq!(status_of(second_id), "pending");
     assert_eq!(balance(&app), Money(10_000_000_000));
-    app.db.with(|conn| Ok(conn.execute("UPDATE payments SET expires_at = 1 WHERE id = ?", [second_id])?)).unwrap();
     // Nothing new until there's another block.
     crate::payments::check_bitcoin_payments(&app).await.unwrap();
     assert_eq!(status_of(second_id), "pending");
@@ -963,11 +962,13 @@ async fn sells_credits_for_monero() {
     assert_eq!(status_of(first_id), "completed");
     assert_eq!(balance(&app), Money(10_000_000_000));
 
-    // Short by half: not until its time is up, then for what was paid.
-    wallet.pay(2, 13_750_000_000, Some(5));
+    // Short by half: credited for what was paid as soon as it's confirmed,
+    // without waiting for a top-up or for its time to be up.
+    wallet.pay(2, 13_750_000_000, Some(1));
     crate::payments::check_monero_payments(&app).await.unwrap();
     assert_eq!(status_of(second_id), "pending");
-    app.db.with(|conn| Ok(conn.execute("UPDATE payments SET expires_at = 1 WHERE id = ?", [second_id])?)).unwrap();
+    wallet.transfers.lock().retain(|t| t["subaddr_index"]["minor"] != 2);
+    wallet.pay(2, 13_750_000_000, Some(2));
     crate::payments::check_monero_payments(&app).await.unwrap();
     assert_eq!(status_of(second_id), "completed");
     assert_eq!(balance(&app), Money(15_000_000_000));

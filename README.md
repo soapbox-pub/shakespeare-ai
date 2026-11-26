@@ -191,9 +191,10 @@ mempool, where a payment can still be double-spent).
 - The amount in sats is fixed when the payment is made, at that moment's rate.
 - **What's paid is what's credited.** A payment is credited in proportion to
   the confirmed sats sent, at its fixed rate, and its fee likewise: paying
-  twice the amount credits twice the credits. Paid in full or more, it's
-  credited at once; paid short, once its time is up, so a top-up before then
-  still counts. Its `amount` and `fee` then say what was credited, and
+  twice the amount credits twice the credits. It's credited as soon as
+  what was sent has confirmed (or, paid in full, as soon as that much has),
+  short or not: a payment isn't held waiting for a top-up. Its `amount` and
+  `fee` then say what was credited, and
   `payments.bitcoin.overpaid` or `.underpaid` is logged.
 - A payment stays payable for a day. One that's been sent something stays
   pending while it confirms, and an address is watched for a week after its

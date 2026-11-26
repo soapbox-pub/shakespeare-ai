@@ -5,7 +5,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { QRCodeCanvas } from '@/components/ui/qrcode';
 import { usePayment, usePaymentMethods } from '@/hooks/useCredits';
-import { coinAmount, coinUnits, isConfirming, type Onchain, onchain, type Payment } from '@/lib/api';
+import { coinUnits, isConfirming, type Onchain, onchain, type Payment } from '@/lib/api';
 import { usd } from '@/lib/format';
 
 /** How to pay a payment, kept up to date until it's paid or expires. */
@@ -24,9 +24,8 @@ export function PaymentView({ payment: initial }: { payment: Payment }) {
   }
 
   const chain = onchain(payment);
-  // Paid in full, or paid short and out of time for a top-up: all that's
-  // left is for it to confirm.
-  if (chain && isConfirming(payment) && (chain.received >= chain.asked || payment.status === 'expired')) {
+  // Sent something, short or not: all that's left is for it to confirm.
+  if (chain && isConfirming(payment)) {
     return <Confirming payment={payment} chain={chain} />;
   }
 
@@ -60,7 +59,7 @@ export function PaymentView({ payment: initial }: { payment: Payment }) {
       )}
       <p className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin" aria-hidden />
-        {chain?.received ? 'Waiting for the rest…' : 'Waiting for payment…'}
+        Waiting for payment…
       </p>
     </div>
   );
@@ -133,23 +132,18 @@ function Confirming({ payment, chain }: { payment: Payment; chain: Onchain }) {
 function Pay({ uri, chain }: { uri: string; chain: Onchain }) {
   const parsed = new URL(uri);
   const address = parsed.pathname;
-  const param = AMOUNT_PARAMS[chain.coin];
-  // Paid short: ask for the rest.
-  const rest = chain.received > 0 && chain.received < chain.asked ? chain.asked - chain.received : undefined;
-  const amount = rest ? coinAmount(chain.coin, rest) : parsed.searchParams.get(param);
-  const href = rest ? uri.replace(new RegExp(`([?&]${param}=)[^&]*`), `$1${amount}`) : uri;
+  const amount = parsed.searchParams.get(AMOUNT_PARAMS[chain.coin]);
   return (
     <div className="space-y-3">
-      <a href={href} className="mx-auto block w-fit rounded-lg bg-white p-2" aria-label="Open the payment in your wallet">
-        <QRCodeCanvas value={href} size={240} />
+      <a href={uri} className="mx-auto block w-fit rounded-lg bg-white p-2" aria-label="Open the payment in your wallet">
+        <QRCodeCanvas value={uri} size={240} />
       </a>
       <CopyField label="Address" value={address} />
-      {amount && <CopyField label={rest ? `Still to send (${chain.coin})` : `Amount (${chain.coin})`} value={amount} />}
+      {amount && <CopyField label={`Amount (${chain.coin})`} value={amount} />}
       <Alert>
         <AlertDescription>
-          {rest
-            ? `${coinUnits(chain.coin, chain.received)} of ${coinUnits(chain.coin, chain.asked)} have arrived. Send the rest before the payment expires, or it's credited for what was sent.`
-            : 'Send exactly this amount, in one transaction. Paying less adds less credit, and paying more adds more.'}
+          Send this amount, in one transaction. It's credited for what arrives, at this rate: paying less adds less
+          credit, and paying more adds more.
         </AlertDescription>
       </Alert>
     </div>

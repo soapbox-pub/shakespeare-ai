@@ -251,8 +251,8 @@ function createShakespeareAI(signer: NostrSigner): OpenAI {
             <p>
               A Lightning payment's <code>url</code> is a bolt11 invoice. A Bitcoin payment's is a BIP21 URI with a fresh
               address and the amount, such as <code>bitcoin:bc1q...?amount=0.00011</code>; it completes once the transaction
-              confirms. What's sent is what's credited: paying more credits more, and paying less credits less once the
-              payment expires (a top-up before then still counts). An account may have 3 bitcoin payments open at once.
+              confirms. What's sent is what's credited, at the rate fixed when the payment was made: paying more credits
+              more, and paying less credits less, as soon as it confirms. An account may have 3 bitcoin payments open at once.
               A Bitcoin payment also has <code>bitcoin</code>: the <code>sats</code> it asks for, and the sats{' '}
               <code>received</code> so far, the mempool included, so a client can show it's been paid while it confirms.
             </p>

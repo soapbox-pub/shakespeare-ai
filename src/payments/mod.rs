@@ -211,9 +211,10 @@ pub async fn check_lightning(app: &App, payment: &Payment) -> Result<()> {
 
 /// Bring a bitcoin payment up to date, given the best block's height, and
 /// credit it for whatever confirmed sats were sent, more or less than it
-/// asked for: at once when it's paid in full, or once its time is up when
-/// it's paid short (a top-up before then still counts), as soon as what was
-/// sent has confirmed. One that's been sent nothing expires with its time.
+/// asked for, at the rate fixed when it was made: as soon as it's paid in
+/// full, or as soon as everything sent has confirmed. Paid short, it isn't
+/// held for a top-up; one sent after it's credited lands uncredited. One
+/// that's been sent nothing expires with its time.
 ///
 /// Something unconfirmed keeps a payment pending past its time, for up to
 /// [`BITCOIN_GRACE`]; after that, what's confirmed is what's credited.
@@ -232,7 +233,7 @@ async fn check_bitcoin(app: &App, config: &crate::config::Bitcoin, payment: &Pay
     let past_due = now > payment.expires_at;
     let past_grace = now > payment.expires_at + BITCOIN_GRACE;
     let settled = received.seen == received.confirmed || past_grace;
-    if received.confirmed > 0 && (received.confirmed >= owed || (past_due && settled)) {
+    if received.confirmed > 0 && (received.confirmed >= owed || settled) {
         let (amount, fee) = (pro_rata(payment.amount, received.confirmed, owed)?, pro_rata(payment.fee, received.confirmed, owed)?);
         let (id, paid) = (payment.id.clone(), received.confirmed);
         if !amount.is_positive() {
@@ -424,9 +425,9 @@ pub async fn pending_credits(app: &App, pubkey: &str) -> Result<Money> {
 
 /// Bring a monero payment up to date with what its subaddress has been
 /// sent, and credit it for whatever's confirmed, more or less than it asked
-/// for, as [`check_bitcoin`] does: at once when it's paid in full, or once
-/// its time is up when it's paid short, as soon as what was sent has
-/// confirmed. One that's been sent nothing expires with its time. Nothing is
+/// for, as [`check_bitcoin`] does: as soon as it's paid in full, or as soon
+/// as everything sent has confirmed, short or not. One that's been sent
+/// nothing expires with its time. Nothing is
 /// advanced before confirmation: a monero block comes every two minutes.
 async fn check_monero(app: &App, payment: &Payment, watch: &store::MoneroWatch, received: monero::Received) -> Result<()> {
     let now = crate::util::now();
@@ -441,7 +442,7 @@ async fn check_monero(app: &App, payment: &Payment, watch: &store::MoneroWatch, 
     let past_due = now > payment.expires_at;
     let past_grace = now > payment.expires_at + MONERO_GRACE;
     let settled = received.seen == received.confirmed || past_grace;
-    if received.confirmed > 0 && (received.confirmed >= owed || (past_due && settled)) {
+    if received.confirmed > 0 && (received.confirmed >= owed || settled) {
         let (amount, fee) = (pro_rata(payment.amount, received.confirmed, owed)?, pro_rata(payment.fee, received.confirmed, owed)?);
         if !amount.is_positive() {
             // Dust worth less than a nanodollar of credit.
